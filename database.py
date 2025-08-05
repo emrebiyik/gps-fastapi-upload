@@ -1,7 +1,12 @@
-import sqlite3
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-DB_FILE = "gps_data.db"
+SQLALCHEMY_DATABASE_URL = "sqlite:///./gps_data.db"
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    return conn
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()

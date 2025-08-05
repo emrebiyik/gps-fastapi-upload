@@ -1,30 +1,29 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
-from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List
 from PIL import Image, ExifTags
+from database import SessionLocal
+from models import ImageGPSData
 import math
-import json
-import sqlite3
-import os
-from fractions import Fraction
 
 app = FastAPI()
 
-DB_FILE = "gps_data.db"
-if not os.path.exists(DB_FILE):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS gps_images (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT,
-            latitude REAL,
-            longitude REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+def get_decimal_from_dms(dms, ref):
+    degrees = dms[0][0] / dms[0][1]
+    minutes = dms[1][0] / dms[1][1]
+    seconds = dms[2][0] / dms[2][1]
+    decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+    if ref in ['S', 'W']:
+        decimal = -decimal
+    return decimal
 
 def extract_gps_pillow(file: UploadFile):
     try:
@@ -36,120 +35,87 @@ def extract_gps_pillow(file: UploadFile):
             return None
 
         gps_info = {}
-        for tag_id, value in exif_data.items():
-            tag = ExifTags.TAGS.get(tag_id)
-            if tag == "GPSInfo":
-                for key in value:
-                    gps_tag = ExifTags.GPSTAGS.get(key)
-                    gps_info[gps_tag] = value[key]
+        for tag, value in exif_data.items():
+            decoded = ExifTags.TAGS.get(tag)
+            if decoded == "GPSInfo":
+                gps_info = value
+                break
 
-        if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
-            def to_float(value):
-                if isinstance(value, tuple):
-                    return value[0] / value[1]
-                elif isinstance(value, Fraction):
-                    return float(value)
-                else:
-                    return float(value)
+        if not gps_info:
+            return None
 
-            def convert_to_decimal(coord, ref):
-                degrees = to_float(coord[0])
-                minutes = to_float(coord[1])
-                seconds = to_float(coord[2])
-                decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
-                if ref in ['S', 'W']:
-                    decimal = -decimal
-                return decimal
+        gps_lat = gps_info.get(2)
+        gps_lat_ref = gps_info.get(1)
+        gps_lon = gps_info.get(4)
+        gps_lon_ref = gps_info.get(3)
 
-            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
-            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+        if gps_lat and gps_lat_ref and gps_lon and gps_lon_ref:
+            lat = get_decimal_from_dms(gps_lat, gps_lat_ref)
+            lon = get_decimal_from_dms(gps_lon, gps_lon_ref)
             return {"latitude": lat, "longitude": lon}
-
     except Exception as e:
-        print(f"[ERROR] GPS extraction failed: {e}")
-        return None
-
+        print(f"Error extracting GPS: {e}")
     return None
 
-
-def calculate_distance_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
 
-    a = math.sin(delta_phi / 2.0) ** 2 + \
-        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
-
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
     return R * c
 
-
 @app.post("/upload-images")
-async def upload_images(
-    images: List[UploadFile] = File(...),
-    metadata: Optional[str] = Form(None)
-):
-    gps_results = []
-    reference_coords = None
-    status_flag = "normal"
+async def upload_images(images: List[UploadFile] = File(...)):
+    gps_info_list = []
+    reference_lat = None
+    reference_lon = None
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    db = SessionLocal()
 
-    for image in images:
+    for idx, image in enumerate(images):
         gps = extract_gps_pillow(image)
-
         if gps:
-            cursor.execute(
-                "INSERT INTO gps_images (filename, latitude, longitude) VALUES (?, ?, ?)",
-                (image.filename, gps["latitude"], gps["longitude"])
-            )
-            conn.commit()
+            lat = gps["latitude"]
+            lon = gps["longitude"]
 
-            if reference_coords is None:
-                reference_coords = gps
-                gps_results.append({
-                    "filename": image.filename,
-                    "gps": gps
-                })
+            if idx == 0:
+                reference_lat = lat
+                reference_lon = lon
+                distance_km = 0
+                flag = "normal"
             else:
-                distance = calculate_distance_km(
-                    reference_coords["latitude"], reference_coords["longitude"],
-                    gps["latitude"], gps["longitude"]
-                )
-                gps_results.append({
-                    "filename": image.filename,
-                    "gps": gps,
-                    "distance_from_reference_km": round(distance, 2)
-                })
+                distance_km = haversine(reference_lat, reference_lon, lat, lon)
+                flag = "abnormal" if distance_km > 1.0 else "normal"
 
-                if distance > 1:
-                    status_flag = "abnormal"
+            # Veritabanına kaydet
+            record = ImageGPSData(
+                filename=image.filename,
+                latitude=lat,
+                longitude=lon,
+                distance_km=distance_km,
+                flag=flag
+            )
+            db.add(record)
+            db.commit()
+
+            gps_info_list.append({
+                "filename": image.filename,
+                "gps": {"latitude": lat, "longitude": lon},
+                "distance_from_home_km": round(distance_km, 3),
+                "flag": flag
+            })
         else:
-            gps_results.append({
+            gps_info_list.append({
                 "filename": image.filename,
                 "gps": None,
-                "note": "No GPS data found"
+                "distance_from_home_km": None,
+                "flag": "abnormal"
             })
 
-    conn.close()
-
-    metadata_info = {}
-    if metadata:
-        try:
-            metadata_info = json.loads(metadata)
-        except Exception:
-            metadata_info["error"] = "Invalid metadata format"
-
-    return JSONResponse(content={
-        "status": status_flag,
-        "gps_info": gps_results,
-        "metadata": metadata_info
-    })
-
-
-@app.get("/")
-def root():
-    return {"message": "GPS FastAPI (Pillow-based) is running."}
+    db.close()
+    return {"status": "ok", "gps_info": gps_info_list}

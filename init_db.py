@@ -1,16 +1,8 @@
-import sqlite3
+from database import engine, Base
+from models import ImageGPSData
 
-conn = sqlite3.connect("gps_data.db")
-cursor = conn.cursor()
+def init():
+    Base.metadata.create_all(bind=engine)
 
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS gps_images (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename TEXT,
-        latitude REAL,
-        longitude REAL
-    )
-''')
-
-conn.commit()
-conn.close()
+if __name__ == "__main__":
+    init()
