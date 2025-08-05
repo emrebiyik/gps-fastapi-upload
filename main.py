@@ -28,34 +28,42 @@ if not os.path.exists(DB_FILE):
     conn.close()
 
 def extract_gps_info(image_file):
-    image_file.file.seek(0)
-    image = Image.open(image_file.file)
+    try:
+        image_file.file.seek(0)
+        image = Image.open(image_file.file)
 
-    exif_data = image.getexif()
-    if not exif_data:
+        exif_data = image.getexif()
+        if not exif_data:
+            print(f"[INFO] No EXIF data in {image_file.filename}")
+            return None
+
+        gps_info = {}
+        for key, val in exif_data.items():
+            tag = TAGS.get(key)
+            if tag == "GPSInfo":
+                for gps_key in val:
+                    gps_tag = GPSTAGS.get(gps_key)
+                    gps_info[gps_tag] = val[gps_key]
+
+        if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
+            def convert_to_decimal(coord, ref):
+                degrees = float(coord[0])
+                minutes = float(coord[1])
+                seconds = float(coord[2])
+                decimal = degrees + minutes / 60 + seconds / 3600
+                if ref in ["S", "W"]:
+                    decimal = -decimal
+                return decimal
+
+            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
+            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+            return {"latitude": lat, "longitude": lon}
+        else:
+            print(f"[INFO] GPS tags missing in {image_file.filename}")
+            return None
+    except Exception as e:
+        print(f"[ERROR] EXIF extraction failed for {image_file.filename}: {e}")
         return None
-
-    gps_info = {}
-    for key, val in exif_data.items():
-        tag = TAGS.get(key)
-        if tag == "GPSInfo":
-            for gps_key in val:
-                gps_tag = GPSTAGS.get(gps_key)
-                gps_info[gps_tag] = val[gps_key]
-
-    if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
-        def convert_to_decimal(coord, ref):
-            degrees, minutes, seconds = coord
-            decimal = degrees + minutes / 60 + seconds / 3600
-            if ref in ["S", "W"]:
-                decimal = -decimal
-            return float(decimal)
-
-        lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
-        lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
-        return {"latitude": lat, "longitude": lon}
-
-    return None
 
 def calculate_distance_km(lat1, lon1, lat2, lon2):
     R = 6371.0  # Earth radius in kilometers
@@ -80,18 +88,18 @@ async def upload_images(
     reference_coords = None
     status_flag = "normal"
 
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
     for idx, image in enumerate(images):
         gps = extract_gps_info(image)
 
         if gps:
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO gps_images (filename, latitude, longitude) VALUES (?, ?, ?)",
                 (image.filename, gps["latitude"], gps["longitude"])
             )
             conn.commit()
-            conn.close()
 
             if reference_coords is None:
                 reference_coords = gps
@@ -114,8 +122,11 @@ async def upload_images(
         else:
             gps_results.append({
                 "filename": image.filename,
-                "gps": None
+                "gps": None,
+                "note": "No EXIF GPS data found"
             })
+
+    conn.close()
 
     metadata_info = {}
     if metadata:
@@ -129,7 +140,7 @@ async def upload_images(
         "gps_info": gps_results,
         "metadata": metadata_info
     })
-    
+
 @app.get("/")
 def read_root():
     return {"message": "GPS FastAPI is up and running."}
