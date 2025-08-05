@@ -129,3 +129,7 @@ async def upload_images(
         "gps_info": gps_results,
         "metadata": metadata_info
     })
+    
+@app.get("/")
+def read_root():
+    return {"message": "GPS FastAPI is up and running."}
