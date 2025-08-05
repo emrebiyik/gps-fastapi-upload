@@ -1,9 +1,9 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
-from PIL import Image, ExifTags
 from database import SessionLocal
 from models import ImageGPSData
+import exifread
 import math
 
 app = FastAPI()
@@ -16,45 +16,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_decimal_from_dms(dms, ref):
-    degrees = dms[0][0] / dms[0][1]
-    minutes = dms[1][0] / dms[1][1]
-    seconds = dms[2][0] / dms[2][1]
-    decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
-    if ref in ['S', 'W']:
-        decimal = -decimal
-    return decimal
-
-def extract_gps_pillow(file: UploadFile):
+def extract_gps_exifread(file: UploadFile):
     try:
         file.file.seek(0)
-        image = Image.open(file.file)
-        exif_data = image._getexif()
+        tags = exifread.process_file(file.file, details=False)
 
-        if not exif_data:
-            return None
+        gps_latitude = tags.get("GPS GPSLatitude")
+        gps_latitude_ref = tags.get("GPS GPSLatitudeRef")
+        gps_longitude = tags.get("GPS GPSLongitude")
+        gps_longitude_ref = tags.get("GPS GPSLongitudeRef")
 
-        gps_info = {}
-        for tag, value in exif_data.items():
-            decoded = ExifTags.TAGS.get(tag)
-            if decoded == "GPSInfo":
-                gps_info = value
-                break
+        if gps_latitude and gps_latitude_ref and gps_longitude and gps_longitude_ref:
+            def to_decimal(coord, ref):
+                d, m, s = [float(x.num) / float(x.den) for x in coord.values]
+                decimal = d + m / 60.0 + s / 3600.0
+                if ref.values[0] in ['S', 'W']:
+                    decimal = -decimal
+                return decimal
 
-        if not gps_info:
-            return None
-
-        gps_lat = gps_info.get(2)
-        gps_lat_ref = gps_info.get(1)
-        gps_lon = gps_info.get(4)
-        gps_lon_ref = gps_info.get(3)
-
-        if gps_lat and gps_lat_ref and gps_lon and gps_lon_ref:
-            lat = get_decimal_from_dms(gps_lat, gps_lat_ref)
-            lon = get_decimal_from_dms(gps_lon, gps_lon_ref)
+            lat = to_decimal(gps_latitude, gps_latitude_ref)
+            lon = to_decimal(gps_longitude, gps_longitude_ref)
             return {"latitude": lat, "longitude": lon}
     except Exception as e:
-        print(f"Error extracting GPS: {e}")
+        print(f"EXIF GPS error: {e}")
     return None
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -78,7 +62,7 @@ async def upload_images(images: List[UploadFile] = File(...)):
     db = SessionLocal()
 
     for idx, image in enumerate(images):
-        gps = extract_gps_pillow(image)
+        gps = extract_gps_exifread(image)
         if gps:
             lat = gps["latitude"]
             lon = gps["longitude"]
@@ -92,7 +76,6 @@ async def upload_images(images: List[UploadFile] = File(...)):
                 distance_km = haversine(reference_lat, reference_lon, lat, lon)
                 flag = "abnormal" if distance_km > 1.0 else "normal"
 
-            # Veritabanına kaydet
             record = ImageGPSData(
                 filename=image.filename,
                 latitude=lat,
