@@ -3,39 +3,13 @@ from fastapi.responses import JSONResponse
 from typing import List, Optional
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
+from database import SessionLocal
+from models import ImageGPSData
 import io
 import json
 import math
-import sqlite3
-import os
 
 app = FastAPI()
-
-# Database setup
-DB_FILE = "gps_data.db"
-if not os.path.exists(DB_FILE):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS gps_images (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT,
-            latitude REAL,
-            longitude REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def insert_into_db(filename: str, latitude: float, longitude: float):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO gps_images (filename, latitude, longitude)
-        VALUES (?, ?, ?)
-    ''', (filename, latitude, longitude))
-    conn.commit()
-    conn.close()
 
 def extract_gps_info(image_bytes: bytes):
     try:
@@ -68,16 +42,20 @@ def extract_gps_info(image_bytes: bytes):
         return None
 
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # km
+    R = 6371
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
     delta_lambda = math.radians(lon2 - lon1)
 
-    a = math.sin(delta_phi / 2)**2 + \
-        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2)**2
+    a = math.sin(delta_phi / 2) ** 2 + \
+        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
+
+@app.get("/")
+def root():
+    return {"message": "GPS FastAPI is up and running."}
 
 @app.post("/upload-images")
 async def upload_images(
@@ -85,10 +63,10 @@ async def upload_images(
     metadata: Optional[str] = Form(None)
 ):
     gps_results = []
-    status = "normal"
-    base_coords = None
+    abnormal = False
+    base_location = None
 
-    for idx, image in enumerate(images):
+    for index, image in enumerate(images):
         content = await image.read()
         gps = extract_gps_info(content)
         result = {
@@ -97,16 +75,28 @@ async def upload_images(
         }
 
         if gps:
-            insert_into_db(image.filename, gps["latitude"], gps["longitude"])
-
-            if idx == 0:
-                base_coords = gps
+            if index == 0:
+                base_location = gps
             else:
-                distance = haversine(base_coords["latitude"], base_coords["longitude"], gps["latitude"], gps["longitude"])
+                distance = haversine(
+                    base_location["latitude"], base_location["longitude"],
+                    gps["latitude"], gps["longitude"]
+                )
                 result["distance_from_base_km"] = round(distance, 2)
                 result["flag"] = "abnormal" if distance > 1.0 else "normal"
                 if distance > 1.0:
-                    status = "abnormal"
+                    abnormal = True
+
+            db = SessionLocal()
+            db_data = ImageGPSData(
+                filename=image.filename,
+                latitude=gps["latitude"],
+                longitude=gps["longitude"]
+            )
+            db.add(db_data)
+            db.commit()
+            db.close()
+
         gps_results.append(result)
 
     try:
@@ -115,7 +105,7 @@ async def upload_images(
         meta_dict = {"error": "Invalid metadata format"}
 
     return JSONResponse(content={
-        "status": status,
+        "status": "abnormal" if abnormal else "normal",
         "gps_info": gps_results,
         "metadata": meta_dict
     })
