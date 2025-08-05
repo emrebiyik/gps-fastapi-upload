@@ -32,6 +32,7 @@ def extract_gps_pillow(file: UploadFile):
         exif_data = image._getexif()
 
         if not exif_data:
+            print("[WARN] No EXIF data found.")
             return None
 
         gps_info = {}
@@ -44,23 +45,33 @@ def extract_gps_pillow(file: UploadFile):
 
         if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
             def convert_to_decimal(coord, ref):
-                degrees, minutes, seconds = coord
-                decimal = degrees[0] / degrees[1] + \
-                          minutes[0] / minutes[1] / 60 + \
-                          seconds[0] / seconds[1] / 3600
-                if ref in ["S", "W"]:
-                    decimal = -decimal
-                return float(decimal)
+                try:
+                    degrees, minutes, seconds = coord
+                    decimal = degrees[0] / degrees[1] + \
+                              minutes[0] / minutes[1] / 60 + \
+                              seconds[0] / seconds[1] / 3600
+                    if ref in ["S", "W"]:
+                        decimal = -decimal
+                    return round(decimal, 6)
+                except Exception as e:
+                    print(f"[ERROR] Decimal conversion failed: {e}")
+                    return None
 
-            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
-            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
-            return {"latitude": lat, "longitude": lon}
+            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info.get("GPSLatitudeRef", "N"))
+            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info.get("GPSLongitudeRef", "E"))
 
-    except Exception as e:
-        print(f"[ERROR] GPS extraction failed: {e}")
+            if lat is not None and lon is not None:
+                return {"latitude": lat, "longitude": lon}
+            else:
+                print("[WARN] Latitude or Longitude conversion failed.")
+                return None
+
+        print("[WARN] No GPS tags found in EXIF.")
         return None
 
-    return None
+    except Exception as e:
+        print(f"[ERROR] Pillow GPS extraction failed: {e}")
+        return None
 
 
 def calculate_distance_km(lat1, lon1, lat2, lon2):
