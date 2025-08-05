@@ -17,6 +17,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def read_root():
+    return {"message": "GPS FastAPI is up and running."}
+
 def get_decimal_from_dms(dms, ref):
     try:
         degrees = float(dms[0])
