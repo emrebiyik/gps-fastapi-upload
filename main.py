@@ -6,6 +6,7 @@ import math
 import json
 import sqlite3
 import os
+from fractions import Fraction
 
 app = FastAPI()
 
@@ -32,7 +33,6 @@ def extract_gps_pillow(file: UploadFile):
         exif_data = image._getexif()
 
         if not exif_data:
-            print("[WARN] No EXIF data found.")
             return None
 
         gps_info = {}
@@ -44,34 +44,32 @@ def extract_gps_pillow(file: UploadFile):
                     gps_info[gps_tag] = value[key]
 
         if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
+            def to_float(value):
+                if isinstance(value, tuple):
+                    return value[0] / value[1]
+                elif isinstance(value, Fraction):
+                    return float(value)
+                else:
+                    return float(value)
+
             def convert_to_decimal(coord, ref):
-                try:
-                    degrees, minutes, seconds = coord
-                    decimal = degrees[0] / degrees[1] + \
-                              minutes[0] / minutes[1] / 60 + \
-                              seconds[0] / seconds[1] / 3600
-                    if ref in ["S", "W"]:
-                        decimal = -decimal
-                    return round(decimal, 6)
-                except Exception as e:
-                    print(f"[ERROR] Decimal conversion failed: {e}")
-                    return None
+                degrees = to_float(coord[0])
+                minutes = to_float(coord[1])
+                seconds = to_float(coord[2])
+                decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+                if ref in ['S', 'W']:
+                    decimal = -decimal
+                return decimal
 
-            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info.get("GPSLatitudeRef", "N"))
-            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info.get("GPSLongitudeRef", "E"))
-
-            if lat is not None and lon is not None:
-                return {"latitude": lat, "longitude": lon}
-            else:
-                print("[WARN] Latitude or Longitude conversion failed.")
-                return None
-
-        print("[WARN] No GPS tags found in EXIF.")
-        return None
+            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
+            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+            return {"latitude": lat, "longitude": lon}
 
     except Exception as e:
-        print(f"[ERROR] Pillow GPS extraction failed: {e}")
+        print(f"[ERROR] GPS extraction failed: {e}")
         return None
+
+    return None
 
 
 def calculate_distance_km(lat1, lon1, lat2, lon2):
@@ -81,8 +79,8 @@ def calculate_distance_km(lat1, lon1, lat2, lon2):
     delta_phi = math.radians(lat2 - lat1)
     delta_lambda = math.radians(lon2 - lon1)
 
-    a = math.sin(delta_phi / 2.0)**2 + \
-        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0)**2
+    a = math.sin(delta_phi / 2.0) ** 2 + \
+        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
 
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
