@@ -1,8 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from typing import List, Optional
-from PIL import Image, ExifTags
-import io
+import exifread
 import json
 import math
 import sqlite3
@@ -26,12 +25,12 @@ if not os.path.exists(DB_FILE):
     conn.close()
 
 
-def get_decimal_from_dms(dms, ref):
+def dms_to_decimal(dms, ref):
     try:
-        degrees = float(dms[0])
-        minutes = float(dms[1])
-        seconds = float(dms[2])
-        decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+        degrees = float(dms[0].num) / float(dms[0].den)
+        minutes = float(dms[1].num) / float(dms[1].den)
+        seconds = float(dms[2].num) / float(dms[2].den)
+        decimal = degrees + minutes / 60 + seconds / 3600
         if ref in ['S', 'W']:
             decimal = -decimal
         return decimal
@@ -40,27 +39,22 @@ def get_decimal_from_dms(dms, ref):
         return None
 
 
-def extract_gps_data_from_bytes(file_bytes):
+def extract_gps_with_exifread(file: UploadFile):
     try:
-        image = Image.open(io.BytesIO(file_bytes))
-        exif_data = image._getexif()
-        if not exif_data:
-            return None
+        file.file.seek(0)
+        tags = exifread.process_file(file.file, details=False)
 
-        gps_info = {}
-        for tag_id, value in exif_data.items():
-            tag = ExifTags.TAGS.get(tag_id, tag_id)
-            if tag == 'GPSInfo':
-                for key in value:
-                    gps_tag = ExifTags.GPSTAGS.get(key, key)
-                    gps_info[gps_tag] = value[key]
+        lat = tags.get("GPS GPSLatitude")
+        lat_ref = tags.get("GPS GPSLatitudeRef")
+        lon = tags.get("GPS GPSLongitude")
+        lon_ref = tags.get("GPS GPSLongitudeRef")
 
-        if 'GPSLatitude' in gps_info and 'GPSLongitude' in gps_info:
-            lat = get_decimal_from_dms(gps_info['GPSLatitude'], gps_info['GPSLatitudeRef'])
-            lon = get_decimal_from_dms(gps_info['GPSLongitude'], gps_info['GPSLongitudeRef'])
-            return {"latitude": lat, "longitude": lon}
+        if lat and lat_ref and lon and lon_ref:
+            latitude = dms_to_decimal(lat.values, lat_ref.values)
+            longitude = dms_to_decimal(lon.values, lon_ref.values)
+            return {"latitude": latitude, "longitude": longitude}
     except Exception as e:
-        print(f"[ERROR] Failed to extract GPS from image: {e}")
+        print(f"[ERROR] Failed to extract EXIF GPS: {e}")
         return None
 
     return None
@@ -93,8 +87,7 @@ async def upload_images(
     cursor = conn.cursor()
 
     for image in images:
-        file_bytes = await image.read()
-        gps = extract_gps_data_from_bytes(file_bytes)
+        gps = extract_gps_with_exifread(image)
 
         if gps:
             cursor.execute(
@@ -125,7 +118,7 @@ async def upload_images(
             gps_results.append({
                 "filename": image.filename,
                 "gps": None,
-                "note": "No EXIF GPS data found"
+                "note": "No readable GPS data found"
             })
 
     conn.close()
@@ -146,4 +139,4 @@ async def upload_images(
 
 @app.get("/")
 def read_root():
-    return {"message": "GPS FastAPI is up and running."}
+    return {"message": "GPS FastAPI (with exifread) is up and running."}
