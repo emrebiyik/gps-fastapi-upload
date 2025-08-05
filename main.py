@@ -16,6 +16,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def read_root():
+    return {"message": "GPS FastAPI is up and running."}
+
 def extract_gps_exifread(file: UploadFile):
     try:
         file.file.seek(0)
@@ -73,6 +77,13 @@ async def upload_images(images: List[UploadFile] = File(...)):
                 distance_km = 0
                 flag = "normal"
             else:
+                if reference_lat is None or reference_lon is None:
+                    db.close()
+                    return {
+                        "status": "error",
+                        "message": f"The first image '{images[0].filename}' has no GPS data. Cannot calculate distances."
+                    }
+
                 distance_km = haversine(reference_lat, reference_lon, lat, lon)
                 flag = "abnormal" if distance_km > 1.0 else "normal"
 
@@ -93,6 +104,13 @@ async def upload_images(images: List[UploadFile] = File(...)):
                 "flag": flag
             })
         else:
+            if idx == 0:
+                db.close()
+                return {
+                    "status": "error",
+                    "message": f"The first image '{image.filename}' has no GPS data. Cannot use it as a reference point."
+                }
+
             gps_info_list.append({
                 "filename": image.filename,
                 "gps": None,
@@ -101,4 +119,4 @@ async def upload_images(images: List[UploadFile] = File(...)):
             })
 
     db.close()
-    return {"status": "ok", "gps_info": gps_info_list}
+    return {"status": "ok", "message": "GPS processing completed successfully.", "gps_info": gps_info_list}
