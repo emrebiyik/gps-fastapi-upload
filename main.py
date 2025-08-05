@@ -2,6 +2,8 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from PIL import Image, ExifTags
+from database import SessionLocal
+from models import ImageGPSData
 import shutil
 import json
 import os
@@ -9,6 +11,7 @@ import math
 
 app = FastAPI()
 
+# CORS settings (for frontend compatibility)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,10 +20,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Health check
 @app.get("/")
 def read_root():
     return {"message": "GPS FastAPI is up and running."}
 
+# Convert DMS to Decimal Degrees
 def get_decimal_from_dms(dms, ref):
     try:
         degrees = float(dms[0])
@@ -33,6 +38,7 @@ def get_decimal_from_dms(dms, ref):
     except Exception as e:
         return {"error": str(e)}
 
+# Extract GPS info from image EXIF
 def extract_gps_data(file_path):
     try:
         image = Image.open(file_path)
@@ -57,6 +63,7 @@ def extract_gps_data(file_path):
 
     return None
 
+# Calculate distance between two GPS points
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371  # Earth radius in km
     phi1 = math.radians(lat1)
@@ -69,6 +76,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
     return R * c
 
+# Upload endpoint
 @app.post("/upload-images")
 async def upload_images(
     images: List[UploadFile] = File(...),
@@ -110,6 +118,22 @@ async def upload_images(
 
         gps_results.append(result)
         os.remove(temp_path)
+
+    # Save to database
+    db = SessionLocal()
+    for result in gps_results:
+        gps = result.get("gps")
+        if isinstance(gps, dict) and gps.get("latitude") is not None:
+            gps_data = ImageGPSData(
+                filename=result["filename"],
+                latitude=gps["latitude"],
+                longitude=gps["longitude"],
+                distance_from_previous_km=result.get("distance_from_previous_km"),
+                flag=result.get("flag")
+            )
+            db.add(gps_data)
+    db.commit()
+    db.close()
 
     return {
         "status": "ok",
