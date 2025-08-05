@@ -1,10 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from typing import List, Optional
-import exifread
+from PIL import Image, ExifTags
 import math
-import sqlite3
 import json
+import sqlite3
 import os
 
 app = FastAPI()
@@ -25,36 +25,39 @@ if not os.path.exists(DB_FILE):
     conn.close()
 
 
-def dms_to_decimal(dms, ref):
-    try:
-        degrees = float(dms[0].num) / float(dms[0].den)
-        minutes = float(dms[1].num) / float(dms[1].den)
-        seconds = float(dms[2].num) / float(dms[2].den)
-        decimal = degrees + minutes / 60 + seconds / 3600
-        if ref in ['S', 'W']:
-            decimal = -decimal
-        return decimal
-    except Exception as e:
-        print(f"[ERROR] DMS to decimal conversion failed: {e}")
-        return None
-
-
-def extract_gps_with_exifread(file: UploadFile):
+def extract_gps_pillow(file: UploadFile):
     try:
         file.file.seek(0)
-        tags = exifread.process_file(file.file, details=False)
+        image = Image.open(file.file)
+        exif_data = image._getexif()
 
-        lat = tags.get("GPS GPSLatitude")
-        lat_ref = tags.get("GPS GPSLatitudeRef")
-        lon = tags.get("GPS GPSLongitude")
-        lon_ref = tags.get("GPS GPSLongitudeRef")
+        if not exif_data:
+            return None
 
-        if lat and lat_ref and lon and lon_ref:
-            latitude = dms_to_decimal(lat.values, lat_ref.values)
-            longitude = dms_to_decimal(lon.values, lon_ref.values)
-            return {"latitude": latitude, "longitude": longitude}
+        gps_info = {}
+        for tag_id, value in exif_data.items():
+            tag = ExifTags.TAGS.get(tag_id)
+            if tag == "GPSInfo":
+                for key in value:
+                    gps_tag = ExifTags.GPSTAGS.get(key)
+                    gps_info[gps_tag] = value[key]
+
+        if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
+            def convert_to_decimal(coord, ref):
+                degrees, minutes, seconds = coord
+                decimal = degrees[0] / degrees[1] + \
+                          minutes[0] / minutes[1] / 60 + \
+                          seconds[0] / seconds[1] / 3600
+                if ref in ["S", "W"]:
+                    decimal = -decimal
+                return float(decimal)
+
+            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
+            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+            return {"latitude": lat, "longitude": lon}
+
     except Exception as e:
-        print(f"[ERROR] Failed to extract EXIF GPS data: {e}")
+        print(f"[ERROR] GPS extraction failed: {e}")
         return None
 
     return None
@@ -67,8 +70,8 @@ def calculate_distance_km(lat1, lon1, lat2, lon2):
     delta_phi = math.radians(lat2 - lat1)
     delta_lambda = math.radians(lon2 - lon1)
 
-    a = math.sin(delta_phi / 2.0) ** 2 + \
-        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+    a = math.sin(delta_phi / 2.0)**2 + \
+        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0)**2
 
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
@@ -87,46 +90,39 @@ async def upload_images(
     cursor = conn.cursor()
 
     for image in images:
-        try:
-            gps = extract_gps_with_exifread(image)
-        except Exception as e:
-            gps = None
-            print(f"[ERROR] Error during GPS extraction for {image.filename}: {e}")
+        gps = extract_gps_pillow(image)
 
         if gps:
-            try:
-                cursor.execute(
-                    "INSERT INTO gps_images (filename, latitude, longitude) VALUES (?, ?, ?)",
-                    (image.filename, gps["latitude"], gps["longitude"])
+            cursor.execute(
+                "INSERT INTO gps_images (filename, latitude, longitude) VALUES (?, ?, ?)",
+                (image.filename, gps["latitude"], gps["longitude"])
+            )
+            conn.commit()
+
+            if reference_coords is None:
+                reference_coords = gps
+                gps_results.append({
+                    "filename": image.filename,
+                    "gps": gps
+                })
+            else:
+                distance = calculate_distance_km(
+                    reference_coords["latitude"], reference_coords["longitude"],
+                    gps["latitude"], gps["longitude"]
                 )
-                conn.commit()
+                gps_results.append({
+                    "filename": image.filename,
+                    "gps": gps,
+                    "distance_from_reference_km": round(distance, 2)
+                })
 
-                if reference_coords is None:
-                    reference_coords = gps
-                    gps_results.append({
-                        "filename": image.filename,
-                        "gps": gps
-                    })
-                else:
-                    distance = calculate_distance_km(
-                        reference_coords["latitude"], reference_coords["longitude"],
-                        gps["latitude"], gps["longitude"]
-                    )
-                    gps_results.append({
-                        "filename": image.filename,
-                        "gps": gps,
-                        "distance_from_reference_km": round(distance, 2)
-                    })
-
-                    if distance > 1:
-                        status_flag = "abnormal"
-            except Exception as e:
-                print(f"[ERROR] DB insert or distance calc failed: {e}")
+                if distance > 1:
+                    status_flag = "abnormal"
         else:
             gps_results.append({
                 "filename": image.filename,
                 "gps": None,
-                "note": "No readable GPS data found"
+                "note": "No GPS data found"
             })
 
     conn.close()
@@ -147,4 +143,4 @@ async def upload_images(
 
 @app.get("/")
 def root():
-    return {"message": "GPS FastAPI is up and running."}
+    return {"message": "GPS FastAPI (Pillow-based) is running."}
