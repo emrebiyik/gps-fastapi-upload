@@ -1,8 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from typing import List, Optional
-from PIL import Image
-from PIL.ExifTags import TAGS, GPSTAGS
+from PIL import Image, ExifTags
 import io
 import json
 import math
@@ -11,7 +10,6 @@ import os
 
 app = FastAPI()
 
-# Database setup
 DB_FILE = "gps_data.db"
 if not os.path.exists(DB_FILE):
     conn = sqlite3.connect(DB_FILE)
@@ -27,46 +25,49 @@ if not os.path.exists(DB_FILE):
     conn.commit()
     conn.close()
 
-def extract_gps_info(image_file):
-    try:
-        image_file.file.seek(0)
-        image = Image.open(image_file.file)
 
-        exif_data = image.getexif()
+def get_decimal_from_dms(dms, ref):
+    try:
+        degrees = float(dms[0])
+        minutes = float(dms[1])
+        seconds = float(dms[2])
+        decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+        if ref in ['S', 'W']:
+            decimal = -decimal
+        return decimal
+    except Exception as e:
+        print(f"[ERROR] DMS conversion failed: {e}")
+        return None
+
+
+def extract_gps_data_from_bytes(file_bytes):
+    try:
+        image = Image.open(io.BytesIO(file_bytes))
+        exif_data = image._getexif()
         if not exif_data:
-            print(f"[INFO] No EXIF data in {image_file.filename}")
             return None
 
         gps_info = {}
-        for key, val in exif_data.items():
-            tag = TAGS.get(key)
-            if tag == "GPSInfo":
-                for gps_key in val:
-                    gps_tag = GPSTAGS.get(gps_key)
-                    gps_info[gps_tag] = val[gps_key]
+        for tag_id, value in exif_data.items():
+            tag = ExifTags.TAGS.get(tag_id, tag_id)
+            if tag == 'GPSInfo':
+                for key in value:
+                    gps_tag = ExifTags.GPSTAGS.get(key, key)
+                    gps_info[gps_tag] = value[key]
 
-        if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
-            def convert_to_decimal(coord, ref):
-                degrees = float(coord[0])
-                minutes = float(coord[1])
-                seconds = float(coord[2])
-                decimal = degrees + minutes / 60 + seconds / 3600
-                if ref in ["S", "W"]:
-                    decimal = -decimal
-                return decimal
-
-            lat = convert_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
-            lon = convert_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+        if 'GPSLatitude' in gps_info and 'GPSLongitude' in gps_info:
+            lat = get_decimal_from_dms(gps_info['GPSLatitude'], gps_info['GPSLatitudeRef'])
+            lon = get_decimal_from_dms(gps_info['GPSLongitude'], gps_info['GPSLongitudeRef'])
             return {"latitude": lat, "longitude": lon}
-        else:
-            print(f"[INFO] GPS tags missing in {image_file.filename}")
-            return None
     except Exception as e:
-        print(f"[ERROR] EXIF extraction failed for {image_file.filename}: {e}")
+        print(f"[ERROR] Failed to extract GPS from image: {e}")
         return None
 
+    return None
+
+
 def calculate_distance_km(lat1, lon1, lat2, lon2):
-    R = 6371.0  # Earth radius in kilometers
+    R = 6371.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
@@ -76,8 +77,8 @@ def calculate_distance_km(lat1, lon1, lat2, lon2):
         math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0)**2
 
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
     return R * c
+
 
 @app.post("/upload-images")
 async def upload_images(
@@ -91,8 +92,9 @@ async def upload_images(
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
-    for idx, image in enumerate(images):
-        gps = extract_gps_info(image)
+    for image in images:
+        file_bytes = await image.read()
+        gps = extract_gps_data_from_bytes(file_bytes)
 
         if gps:
             cursor.execute(
@@ -140,6 +142,7 @@ async def upload_images(
         "gps_info": gps_results,
         "metadata": metadata_info
     })
+
 
 @app.get("/")
 def read_root():
