@@ -3,9 +3,12 @@ from database import Base, engine
 import models
 
 def init():
-    print("📦 Creating tables if not exist...")
-    Base.metadata.create_all(bind=engine)
-    print("✅ DB initialized at:", engine.url)
+    print("📌 Ensuring tables exist...")
+    try:
+        Base.metadata.create_all(bind=engine)
+        print("✅ Tables checked/created.")
+    except Exception as e:
+        print("⚠️ Skipping create_all due to:", e)
 
 if __name__ == "__main__":
     init()

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from database import get_db, engine, Base
+from database import get_db
 from models import (
     User, GPSData, ImageAsset,
     BankMetrics, MobileMoneyMetrics, CallLogMetrics,
@@ -20,25 +20,11 @@ app = FastAPI(title="Credit Scoring API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # prod'da kısıtla
+    allow_origins=["*"],            # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ----------------- Ensure Tables On Startup -----------------
-@app.on_event("startup")
-def _ensure_tables():
-    """
-    Shell kullanmadan, servis her ayağa kalktığında tabloların varlığını garanti eder.
-    Idempotent: yoksa oluşturur, varsa dokunmaz.
-    """
-    try:
-        # MODELLERİN YÜKLÜ OLDUĞUNDAN EMİN OLMAK İÇİN import models üstte.
-        Base.metadata.create_all(bind=engine)
-        print("✅ Ensured DB tables exist.")
-    except Exception as e:
-        print("⚠️ DB init error:", e)
 
 # ----------------- Utilities -----------------
 def get_or_create_user(db: Session, external_user_id: str) -> User:
@@ -209,11 +195,14 @@ async def ingest_gps(
         raise HTTPException(status_code=400, detail="external_user_id missing in metadata")
     user = get_or_create_user(db, external_user_id)
 
-    reference_lat = meta.get("reference_lat")
-    reference_lon = meta.get("reference_lon")
+    # Cast reference coords to float defensively
+    reference_lat_raw = meta.get("reference_lat")
+    reference_lon_raw = meta.get("reference_lon")
+    reference_lat = float(reference_lat_raw) if reference_lat_raw is not None else None
+    reference_lon = float(reference_lon_raw) if reference_lon_raw is not None else None
 
     saved = 0
-    items = []
+    items: List[Dict[str, Any]] = []
     for file in images:
         try:
             file.file.seek(0)
@@ -238,7 +227,7 @@ async def ingest_gps(
 
             distance_km = None
             flag = None
-            if gps_lat is not None and gps_lon is not None and reference_lat and reference_lon:
+            if gps_lat is not None and gps_lon is not None and reference_lat is not None and reference_lon is not None:
                 from math import radians, sin, cos, sqrt, atan2
                 R = 6371.0
                 dlat = radians(reference_lat - gps_lat)
