@@ -16,18 +16,18 @@ from models import (
     CreditScore
 )
 
-# ---------- App & CORS ----------
+# ----------------- App & CORS -----------------
 app = FastAPI(title="Credit Scoring API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],            # tighten for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Utilities ----------
+# ----------------- Utilities -----------------
 def get_or_create_user(db: Session, external_user_id: str) -> User:
     if not external_user_id:
         raise ValueError("external_user_id is required")
@@ -43,12 +43,12 @@ def get_or_create_user(db: Session, external_user_id: str) -> User:
 def row2dict(row):
     return {c.name: getattr(row, c.name) for c in row.__table__.columns} if row else None
 
-# ---------- Health ----------
+# ----------------- Health -----------------
 @app.get("/")
 def read_root():
     return {"message": "Credit Scoring API is up and running."}
 
-# ---------- Pydantic Schemas (Ingest) ----------
+# ----------------- Schemas -----------------
 class BankIn(BaseModel):
     external_user_id: str = Field(..., description="ID from upstream services")
     income_avg_3m: float | None = None
@@ -86,7 +86,7 @@ class AssetsIn(BaseModel):
 class ScoreIn(BaseModel):
     external_user_id: str
 
-# ---------- Ingest: Bank ----------
+# ----------------- Ingest: Bank -----------------
 @app.post("/api/v1/bank/ingest")
 def ingest_bank(payload: BankIn, db: Session = Depends(get_db)):
     try:
@@ -107,16 +107,14 @@ def ingest_bank(payload: BankIn, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------- Ingest: Mobile Money ----------
+# ----------------- Ingest: Mobile Money -----------------
 @app.post("/api/v1/mobile/ingest")
 def ingest_mobile(payload: MobileIn, db: Session = Depends(get_db)):
     try:
         user = get_or_create_user(db, payload.external_user_id)
         last_txn_dt = None
         if payload.last_txn_at:
-            # tolerant ISO parser
             last_txn_dt = datetime.fromisoformat(payload.last_txn_at.replace("Z", ""))
-
         row = MobileMoneyMetrics(
             user_id=user.id,
             mm_txn_90d=payload.mm_txn_90d,
@@ -132,7 +130,7 @@ def ingest_mobile(payload: MobileIn, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------- Ingest: Call Logs ----------
+# ----------------- Ingest: Call Logs -----------------
 @app.post("/api/v1/calllogs/ingest")
 def ingest_calllogs(payload: CallLogsIn, db: Session = Depends(get_db)):
     try:
@@ -151,7 +149,7 @@ def ingest_calllogs(payload: CallLogsIn, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------- Ingest: Image Assets ----------
+# ----------------- Ingest: Image Assets -----------------
 @app.post("/api/v1/assets/ingest")
 def ingest_assets(payload: AssetsIn, db: Session = Depends(get_db)):
     try:
@@ -173,14 +171,11 @@ def ingest_assets(payload: AssetsIn, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------- Ingest: GPS (file upload example)
-# If you already have an EXIF parser, plug it here. Below is a minimal skeleton.
+# ----------------- Ingest: GPS (EXIF) -----------------
 from PIL import Image, ExifTags
-import math
 
 def _dms_to_decimal(dms, ref):
     # dms as ((deg_num,deg_den),(min_num,min_den),(sec_num,sec_den))
-    # ref: 'N','S','E','W'
     deg = dms[0][0] / dms[0][1]
     minutes = dms[1][0] / dms[1][1]
     seconds = dms[2][0] / dms[2][1]
@@ -195,8 +190,7 @@ async def ingest_gps(
     metadata: Optional[str] = Form(None),
     db: Session = Depends(get_db)
 ):
-    # metadata may contain {"external_user_id": "...", "reference_lat": .., "reference_lon": ..}
-    import json
+    import json, math
     meta = json.loads(metadata) if metadata else {}
     external_user_id = meta.get("external_user_id")
     if not external_user_id:
@@ -217,18 +211,13 @@ async def ingest_gps(
             taken_at = None
 
             if exif:
-                # map tag names
                 exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
                 gps_info = exif_data.get("GPSInfo")
                 if gps_info:
-                    gps_parsed = {}
-                    for t in gps_info:
-                        sub_tag = ExifTags.GPSTAGS.get(t, t)
-                        gps_parsed[sub_tag] = gps_info[t]
+                    gps_parsed = {ExifTags.GPSTAGS.get(t, t): gps_info[t] for t in gps_info}
                     if all(k in gps_parsed for k in ["GPSLatitude", "GPSLatitudeRef", "GPSLongitude", "GPSLongitudeRef"]):
                         gps_lat = _dms_to_decimal(gps_parsed["GPSLatitude"], gps_parsed["GPSLatitudeRef"])
                         gps_lon = _dms_to_decimal(gps_parsed["GPSLongitude"], gps_parsed["GPSLongitudeRef"])
-                # DateTimeOriginal if available
                 if "DateTimeOriginal" in exif_data:
                     try:
                         taken_at = datetime.strptime(exif_data["DateTimeOriginal"], "%Y:%m:%d %H:%M:%S")
@@ -238,16 +227,14 @@ async def ingest_gps(
             distance_km = None
             flag = None
             if gps_lat is not None and gps_lon is not None and reference_lat and reference_lon:
-                def haversine(lat1, lon1, lat2, lon2):
-                    R = 6371.0
-                    from math import radians, sin, cos, sqrt, atan2
-                    dlat = radians(lat2-lat1)
-                    dlon = radians(lon2-lon1)
-                    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-                    c = 2*atan2(sqrt(a), sqrt(1-a))
-                    return R*c
-                distance_km = haversine(reference_lat, reference_lon, gps_lat, gps_lon)
-                flag = "abnormal" if distance_km is not None and distance_km > 100 else "normal"
+                from math import radians, sin, cos, sqrt, atan2
+                R = 6371.0
+                dlat = radians(reference_lat - gps_lat)
+                dlon = radians(reference_lon - gps_lon)
+                a = sin(dlat/2)**2 + cos(radians(gps_lat))*cos(radians(reference_lat))*sin(dlon/2)**2
+                c = 2*atan2(sqrt(a), sqrt(1-a))
+                distance_km = R * c
+                flag = "abnormal" if distance_km > 100 else "normal"
 
             row = GPSData(
                 user_id=user.id,
@@ -271,7 +258,6 @@ async def ingest_gps(
                 "taken_at": taken_at.isoformat() if taken_at else None
             })
         except Exception as e:
-            # do not fail whole batch
             items.append({
                 "user_id": external_user_id,
                 "filename": getattr(file, "filename", None),
@@ -281,7 +267,7 @@ async def ingest_gps(
     db.commit()
     return {"status": "ok", "saved": saved, "items": items}
 
-# ---------- Feature Snapshot ----------
+# ----------------- Feature Snapshot -----------------
 @app.get("/api/v1/users/{external_user_id}/features")
 def get_user_features(external_user_id: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.external_user_id == external_user_id).first()
@@ -303,54 +289,50 @@ def get_user_features(external_user_id: str, db: Session = Depends(get_db)):
         "assets": [row2dict(a) for a in latest_assets] if latest_assets else []
     }
 
-# ---------- Rule-Based Scoring ----------
+# ----------------- Rule-Based Scoring -----------------
 def score_bank(feat: Dict[str, Any] | None) -> int:
     if not feat:
         return 0
-    score = 0
-    # editable rules
-    if (feat.get("average_balance") or 0) >= 1500: score += 3
-    if (feat.get("net_cash_flow_90d") or 0) > 0: score += 2
-    if (feat.get("bounced_txn_90d") or 0) >= 1: score -= 2
-    if (feat.get("overdraft_days_90d") or 0) > 5: score -= 3
-    if (feat.get("income_avg_3m") or 0) >= 800: score += 3
-    return score
+    s = 0
+    if (feat.get("average_balance") or 0) >= 1500: s += 3
+    if (feat.get("net_cash_flow_90d") or 0) > 0: s += 2
+    if (feat.get("bounced_txn_90d") or 0) >= 1: s -= 2
+    if (feat.get("overdraft_days_90d") or 0) > 5: s -= 3
+    if (feat.get("income_avg_3m") or 0) >= 800: s += 3
+    return s
 
 def score_mobile(feat: Dict[str, Any] | None) -> int:
     if not feat:
         return 0
-    score = 0
-    if (feat.get("mm_txn_90d") or 0) >= 30: score += 2
-    if (feat.get("mm_volume_90d") or 0) >= 500: score += 2
-    if (feat.get("mm_active_days_90d") or 0) >= 20: score += 1
-    if (feat.get("avg_ticket_90d") or 9999) < 2: score -= 1
-    return score
+    s = 0
+    if (feat.get("mm_txn_90d") or 0) >= 30: s += 2
+    if (feat.get("mm_volume_90d") or 0) >= 500: s += 2
+    if (feat.get("mm_active_days_90d") or 0) >= 20: s += 1
+    if (feat.get("avg_ticket_90d") or 9999) < 2: s -= 1
+    return s
 
 def score_calllogs(feat: Dict[str, Any] | None) -> int:
     if not feat:
         return 0
-    score = 0
-    if (feat.get("unique_contacts_30d") or 0) >= 15: score += 1
+    s = 0
+    if (feat.get("unique_contacts_30d") or 0) >= 15: s += 1
     ratio = feat.get("incoming_outgoing_ratio_30d")
-    if ratio is not None and ratio < 0.3:  # example "too low" threshold
-        score -= 1
-    return score
+    if ratio is not None and ratio < 0.3:  # example threshold
+        s -= 1
+    return s
 
 def score_assets(asset_list: List[Dict[str, Any]] | None) -> int:
     if not asset_list:
         return 0
-    score = 0
     plus = 0
     for a in asset_list:
         if a.get("image_verified") and (a.get("estimated_value") or 0) >= 1000:
             plus += 2
-    # cap to avoid runaway
-    return min(plus, 4)
+    return min(plus, 4)  # cap
 
 def score_gps(feat: Dict[str, Any] | None) -> int:
     if not feat:
         return 0
-    # simple: penalize if latest is abnormal
     return -1 if feat.get("flag") == "abnormal" else 0
 
 def decision_from_score(total: int) -> str:
@@ -361,7 +343,10 @@ def decision_from_score(total: int) -> str:
 
 @app.post("/api/v1/score/compute")
 def compute_score(payload: ScoreIn, db: Session = Depends(get_db)):
-    # get feature snapshot
+    user = db.query(User).filter(User.external_user_id == payload.external_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
     features = get_user_features(payload.external_user_id, db)
 
     bank_s = score_bank(features.get("bank"))
@@ -373,10 +358,6 @@ def compute_score(payload: ScoreIn, db: Session = Depends(get_db)):
     total = bank_s + mob_s + call_s + gps_s + assets_s
     decision = decision_from_score(total)
 
-    # persist
-    user = db.query(User).filter(User.external_user_id == payload.external_user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
     row = CreditScore(
         user_id=user.id,
         score=total,

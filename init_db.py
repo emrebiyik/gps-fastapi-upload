@@ -1,6 +1,6 @@
 # init_db.py
 from database import Base, engine
-import models  
+import models
 
 def init():
     print("📦 Creating tables if not exist...")
