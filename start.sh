@@ -1,9 +1,6 @@
 #!/bin/bash
 set -e
 
-# go to app folder
-cd v2
-
 echo "Starting initialization..."
 python init_db.py
 
