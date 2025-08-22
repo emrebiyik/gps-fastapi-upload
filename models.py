@@ -1,21 +1,20 @@
-# models.py (User model only)
-
-from sqlalchemy import Column, Integer, String, DateTime, func
+from datetime import datetime
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from database import Base
 
-class User(Base):
-    __tablename__ = "users"
+class GPSData(Base):
+    __tablename__ = "gps_data"
 
     id = Column(Integer, primary_key=True, index=True)
-    external_user_id = Column(String, nullable=False, unique=True, index=True)  # unique + index (avoid duplicate constraint issue)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    filename = Column(String, nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    distance_km = Column(Float, nullable=True)
+    flag = Column(String, nullable=True)   # "normal" or "abnormal"
+    taken_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())  # auto timestamp
-
-    # Relationships (cascade delete ensures related records are removed if user is deleted)
-    bank_metrics = relationship("BankMetrics", back_populates="user", cascade="all, delete-orphan")
-    mobile_money_metrics = relationship("MobileMoneyMetrics", back_populates="user", cascade="all, delete-orphan")
-    call_log_metrics = relationship("CallLogMetrics", back_populates="user", cascade="all, delete-orphan")
-    gps_data = relationship("GPSData", back_populates="user", cascade="all, delete-orphan")
-    image_assets = relationship("ImageAsset", back_populates="user", cascade="all, delete-orphan")
-    credit_scores = relationship("CreditScore", back_populates="user", cascade="all, delete-orphan")
+# optional: explicit exports
+__all__ = ["GPSData"]
