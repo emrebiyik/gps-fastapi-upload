@@ -1,4 +1,3 @@
-# main.py
 from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional, Dict, Any
@@ -9,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import get_db, engine, Base
 from models import (
     User, GPSData, ImageAsset,
     BankMetrics, MobileMoneyMetrics, CallLogMetrics,
@@ -21,11 +20,25 @@ app = FastAPI(title="Credit Scoring API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # tighten for prod
+    allow_origins=["*"],            # prod'da kısıtla
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----------------- Ensure Tables On Startup -----------------
+@app.on_event("startup")
+def _ensure_tables():
+    """
+    Shell kullanmadan, servis her ayağa kalktığında tabloların varlığını garanti eder.
+    Idempotent: yoksa oluşturur, varsa dokunmaz.
+    """
+    try:
+        # MODELLERİN YÜKLÜ OLDUĞUNDAN EMİN OLMAK İÇİN import models üstte.
+        Base.metadata.create_all(bind=engine)
+        print("✅ Ensured DB tables exist.")
+    except Exception as e:
+        print("⚠️ DB init error:", e)
 
 # ----------------- Utilities -----------------
 def get_or_create_user(db: Session, external_user_id: str) -> User:
@@ -50,7 +63,7 @@ def read_root():
 
 # ----------------- Schemas -----------------
 class BankIn(BaseModel):
-    external_user_id: str = Field(..., description="ID from upstream services")
+    external_user_id: str = Field(..., description="Upstream user id")
     income_avg_3m: float | None = None
     average_balance: float | None = None
     net_cash_flow_90d: float | None = None
@@ -175,7 +188,6 @@ def ingest_assets(payload: AssetsIn, db: Session = Depends(get_db)):
 from PIL import Image, ExifTags
 
 def _dms_to_decimal(dms, ref):
-    # dms as ((deg_num,deg_den),(min_num,min_den),(sec_num,sec_den))
     deg = dms[0][0] / dms[0][1]
     minutes = dms[1][0] / dms[1][1]
     seconds = dms[2][0] / dms[2][1]
@@ -190,7 +202,7 @@ async def ingest_gps(
     metadata: Optional[str] = Form(None),
     db: Session = Depends(get_db)
 ):
-    import json, math
+    import json
     meta = json.loads(metadata) if metadata else {}
     external_user_id = meta.get("external_user_id")
     if not external_user_id:
@@ -289,7 +301,7 @@ def get_user_features(external_user_id: str, db: Session = Depends(get_db)):
         "assets": [row2dict(a) for a in latest_assets] if latest_assets else []
     }
 
-# ----------------- Rule-Based Scoring -----------------
+# ----------------- Scoring -----------------
 def score_bank(feat: Dict[str, Any] | None) -> int:
     if not feat:
         return 0
@@ -317,7 +329,7 @@ def score_calllogs(feat: Dict[str, Any] | None) -> int:
     s = 0
     if (feat.get("unique_contacts_30d") or 0) >= 15: s += 1
     ratio = feat.get("incoming_outgoing_ratio_30d")
-    if ratio is not None and ratio < 0.3:  # example threshold
+    if ratio is not None and ratio < 0.3:
         s -= 1
     return s
 
@@ -328,7 +340,7 @@ def score_assets(asset_list: List[Dict[str, Any]] | None) -> int:
     for a in asset_list:
         if a.get("image_verified") and (a.get("estimated_value") or 0) >= 1000:
             plus += 2
-    return min(plus, 4)  # cap
+    return min(plus, 4)
 
 def score_gps(feat: Dict[str, Any] | None) -> int:
     if not feat:
