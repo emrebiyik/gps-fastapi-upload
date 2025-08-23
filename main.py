@@ -173,10 +173,29 @@ def ingest_assets(payload: AssetsIn, db: Session = Depends(get_db)):
 # ----------------- Ingest: GPS (EXIF) -----------------
 from PIL import Image, ExifTags
 
+def _as_float(x):
+    """
+    EXIF DMS bileşenleri (IFDRational, (num,den) tuple veya düz float/int) için güvenli çeviri.
+    """
+    try:
+        if isinstance(x, (tuple, list)) and len(x) == 2:
+            num, den = x
+            return float(num) / float(den) if den else float(num)
+        return float(x)
+    except Exception:
+        return None
+
 def _dms_to_decimal(dms, ref):
-    deg = dms[0][0] / dms[0][1]
-    minutes = dms[1][0] / dms[1][1]
-    seconds = dms[2][0] / dms[2][1]
+    """
+    DMS -> decimal derece. Bileşenler tuple/float/int olabilir. Hatalıysa None döner.
+    """
+    if not dms or len(dms) != 3:
+        return None
+    deg = _as_float(dms[0])
+    minutes = _as_float(dms[1])
+    seconds = _as_float(dms[2])
+    if deg is None or minutes is None or seconds is None:
+        return None
     val = deg + (minutes / 60.0) + (seconds / 3600.0)
     if ref in ['S', 'W']:
         val = -val
