@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Boolean,
-    ForeignKey, UniqueConstraint, Index, JSON
+    ForeignKey, JSON
 )
 from sqlalchemy.orm import relationship
 from database import Base
@@ -17,10 +17,11 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    external_user_id = Column(String, nullable=False, unique=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # NOT: unique=True zaten benzersiz indeks oluşturur; index=True gereksiz ve çakışma yaratıyordu.
+    external_user_id = Column(String, nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    # Optional relationships (not required by the app to work)
+    # Optional relationships
     bank_metrics = relationship("BankMetrics", back_populates="user", cascade="all, delete-orphan")
     mobile_money_metrics = relationship("MobileMoneyMetrics", back_populates="user", cascade="all, delete-orphan")
     call_log_metrics = relationship("CallLogMetrics", back_populates="user", cascade="all, delete-orphan")
@@ -45,10 +46,9 @@ class BankMetrics(Base):
     overdraft_days_90d = Column(Integer, nullable=True)
     statement_period_days = Column(Integer, nullable=True)
 
-    # If you ever need currency, keep it optional
     currency_code = Column(String, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="bank_metrics")
 
@@ -69,7 +69,7 @@ class MobileMoneyMetrics(Base):
     last_txn_at = Column(DateTime, nullable=True)
 
     currency_code = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="mobile_money_metrics")
 
@@ -88,7 +88,7 @@ class CallLogMetrics(Base):
     incoming_outgoing_ratio_30d = Column(Float, nullable=True)
     airtime_spend_30d = Column(Float, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="call_log_metrics")
 
@@ -108,7 +108,7 @@ class ImageAsset(Base):
     source_image = Column(String, nullable=True)
 
     currency_code = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="image_assets")
 
@@ -129,7 +129,7 @@ class GPSData(Base):
     flag = Column(String, nullable=True)  # "normal" / "abnormal"
     taken_at = Column(DateTime, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="gps_points")
 
@@ -147,13 +147,10 @@ class CreditScore(Base):
     decision = Column(String, nullable=False)  # e.g., "deny", "approve_150", ...
     explanation_json = Column(JSON, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="credit_scores")
 
-
-# Useful indexes / constraints
-Index("ix_users_external_user_id", User.external_user_id, unique=True)
 
 __all__ = [
     "User",
