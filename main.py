@@ -189,27 +189,33 @@ async def ingest_gps(
     db: Session = Depends(get_db)
 ):
     import json
-    meta = json.loads(metadata) if metadata else {}
+    try:
+        meta = json.loads(metadata) if metadata else {}
+    except Exception:
+        meta = {}
+
     external_user_id = meta.get("external_user_id")
     if not external_user_id:
         raise HTTPException(status_code=400, detail="external_user_id missing in metadata")
     user = get_or_create_user(db, external_user_id)
 
-    # Cast reference coords to float defensively
-    reference_lat_raw = meta.get("reference_lat")
-    reference_lon_raw = meta.get("reference_lon")
-    reference_lat = float(reference_lat_raw) if reference_lat_raw is not None else None
-    reference_lon = float(reference_lon_raw) if reference_lon_raw is not None else None
+    # safe float conversion
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
 
-    saved = 0
-    items: List[Dict[str, Any]] = []
+    reference_lat = _to_float(meta.get("reference_lat"))
+    reference_lon = _to_float(meta.get("reference_lon"))
+
+    saved, items = 0, []
     for file in images:
         try:
             file.file.seek(0)
             image = Image.open(file.file)
             exif = image._getexif() if hasattr(image, "_getexif") else None
-            gps_lat = gps_lon = None
-            taken_at = None
+            gps_lat = gps_lon = taken_at = None
 
             if exif:
                 exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
@@ -225,8 +231,7 @@ async def ingest_gps(
                     except Exception:
                         taken_at = None
 
-            distance_km = None
-            flag = None
+            distance_km, flag = None, None
             if gps_lat is not None and gps_lon is not None and reference_lat is not None and reference_lon is not None:
                 from math import radians, sin, cos, sqrt, atan2
                 R = 6371.0
@@ -235,7 +240,7 @@ async def ingest_gps(
                 a = sin(dlat/2)**2 + cos(radians(gps_lat))*cos(radians(reference_lat))*sin(dlon/2)**2
                 c = 2*atan2(sqrt(a), sqrt(1-a))
                 distance_km = R * c
-                flag = "abnormal" if distance_km > 100 else "normal"
+                flag = "abnormal" if distance_km > 1 else "normal"  # eşik 1 km
 
             row = GPSData(
                 user_id=user.id,
