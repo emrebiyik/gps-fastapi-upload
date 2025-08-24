@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import desc
@@ -224,26 +224,22 @@ def _extract_latlon(upload: UploadFile) -> Tuple[Optional[float], Optional[float
 @app.post("/api/v1/gps/ingest")
 async def ingest_gps(
     images: List[UploadFile] = File(..., description="First image is the reference. It MUST contain GPS."),
-    metadata: Optional[str] = Form(None, description='JSON string: {"external_user_id":"u_123"}'),
     db: Session = Depends(get_db)
 ):
-    # Parse metadata safely (we only require external_user_id now)
-    import json
-    try:
-        meta = json.loads(metadata) if metadata else {}
-    except Exception:
-        meta = {}
-
-    external_user_id = meta.get("external_user_id")
-    if not external_user_id:
-        raise HTTPException(status_code=400, detail="external_user_id missing in metadata")
+    """
+    Ingest images without any metadata input.
+    - First image is ALWAYS the reference (must contain GPS).
+    - Distances for the rest are computed against the first image.
+    - Data is linked to a default 'anonymous' user.
+    """
+    # Fallback user (no metadata required)
+    external_user_id = "anonymous"
     user = get_or_create_user(db, external_user_id)
 
-    # Require at least one image
     if not images:
         raise HTTPException(status_code=400, detail="No images uploaded")
 
-    # --- Always use FIRST image as reference ---
+    # --- reference = FIRST image ---
     ref_file = images[0]
     ref_lat, ref_lon, ref_taken_at = _extract_latlon(ref_file)
     if ref_lat is None or ref_lon is None:
