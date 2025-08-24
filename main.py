@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -174,9 +174,7 @@ def ingest_assets(payload: AssetsIn, db: Session = Depends(get_db)):
 from PIL import Image, ExifTags
 
 def _as_float(x):
-    """
-    EXIF DMS bileşenleri (IFDRational, (num,den) tuple veya düz float/int) için güvenli çeviri.
-    """
+    """Safe numeric conversion for EXIF DMS components (IFDRational, (num, den), or plain float/int)."""
     try:
         if isinstance(x, (tuple, list)) and len(x) == 2:
             num, den = x
@@ -186,14 +184,10 @@ def _as_float(x):
         return None
 
 def _dms_to_decimal(dms, ref):
-    """
-    DMS -> decimal derece. Bileşenler tuple/float/int olabilir. Hatalıysa None döner.
-    """
+    """Convert (deg, min, sec) to decimal degrees. Components can be tuple/float/int. Returns None if invalid."""
     if not dms or len(dms) != 3:
         return None
-    deg = _as_float(dms[0])
-    minutes = _as_float(dms[1])
-    seconds = _as_float(dms[2])
+    deg = _as_float(dms[0]); minutes = _as_float(dms[1]); seconds = _as_float(dms[2])
     if deg is None or minutes is None or seconds is None:
         return None
     val = deg + (minutes / 60.0) + (seconds / 3600.0)
@@ -201,12 +195,39 @@ def _dms_to_decimal(dms, ref):
         val = -val
     return val
 
+def _extract_latlon(upload: UploadFile) -> Tuple[Optional[float], Optional[float], Optional[datetime]]:
+    """Extract (lat, lon, taken_at) from one image. Returns (None, None, None) if EXIF/GPS missing."""
+    try:
+        upload.file.seek(0)
+        img = Image.open(upload.file)
+        exif = img._getexif() if hasattr(img, "_getexif") else None
+        if not exif:
+            return None, None, None
+        exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+        gps_info = exif_data.get("GPSInfo")
+        lat = lon = None
+        if gps_info:
+            g = {ExifTags.GPSTAGS.get(t, t): gps_info[t] for t in gps_info}
+            if all(k in g for k in ["GPSLatitude", "GPSLatitudeRef", "GPSLongitude", "GPSLongitudeRef"]):
+                lat = _dms_to_decimal(g["GPSLatitude"], g["GPSLatitudeRef"])
+                lon = _dms_to_decimal(g["GPSLongitude"], g["GPSLongitudeRef"])
+        taken_at = None
+        if "DateTimeOriginal" in exif_data:
+            try:
+                taken_at = datetime.strptime(exif_data["DateTimeOriginal"], "%Y:%m:%d %H:%M:%S")
+            except Exception:
+                taken_at = None
+        return lat, lon, taken_at
+    except Exception:
+        return None, None, None
+
 @app.post("/api/v1/gps/ingest")
 async def ingest_gps(
-    images: List[UploadFile] = File(...),
-    metadata: Optional[str] = Form(None),
+    images: List[UploadFile] = File(..., description="First image is the reference. It MUST contain GPS."),
+    metadata: Optional[str] = Form(None, description='JSON string: {"external_user_id":"u_123"}'),
     db: Session = Depends(get_db)
 ):
+    # Parse metadata safely (we only require external_user_id now)
     import json
     try:
         meta = json.loads(metadata) if metadata else {}
@@ -218,79 +239,74 @@ async def ingest_gps(
         raise HTTPException(status_code=400, detail="external_user_id missing in metadata")
     user = get_or_create_user(db, external_user_id)
 
-    # safe float conversion
-    def _to_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
+    # Require at least one image
+    if not images:
+        raise HTTPException(status_code=400, detail="No images uploaded")
 
-    reference_lat = _to_float(meta.get("reference_lat"))
-    reference_lon = _to_float(meta.get("reference_lon"))
+    # --- Always use FIRST image as reference ---
+    ref_file = images[0]
+    ref_lat, ref_lon, ref_taken_at = _extract_latlon(ref_file)
+    if ref_lat is None or ref_lon is None:
+        # Hard fail if first image has no GPS
+        raise HTTPException(status_code=400, detail="First image has no GPS data; cannot use it as reference")
 
     saved, items = 0, []
-    for file in images:
-        try:
-            file.file.seek(0)
-            image = Image.open(file.file)
-            exif = image._getexif() if hasattr(image, "_getexif") else None
-            gps_lat = gps_lon = taken_at = None
 
-            if exif:
-                exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
-                gps_info = exif_data.get("GPSInfo")
-                if gps_info:
-                    gps_parsed = {ExifTags.GPSTAGS.get(t, t): gps_info[t] for t in gps_info}
-                    if all(k in gps_parsed for k in ["GPSLatitude", "GPSLatitudeRef", "GPSLongitude", "GPSLongitudeRef"]):
-                        gps_lat = _dms_to_decimal(gps_parsed["GPSLatitude"], gps_parsed["GPSLatitudeRef"])
-                        gps_lon = _dms_to_decimal(gps_parsed["GPSLongitude"], gps_parsed["GPSLongitudeRef"])
-                if "DateTimeOriginal" in exif_data:
-                    try:
-                        taken_at = datetime.strptime(exif_data["DateTimeOriginal"], "%Y:%m:%d %H:%M:%S")
-                    except Exception:
-                        taken_at = None
+    for idx, up in enumerate(images):
+        lat, lon, taken_at = _extract_latlon(up)
 
-            distance_km, flag = None, None
-            if gps_lat is not None and gps_lon is not None and reference_lat is not None and reference_lon is not None:
+        distance_km = None
+        flag = None
+        if lat is not None and lon is not None:
+            if idx == 0:
+                # Reference image
+                distance_km = 0.0
+                flag = "normal"
+            else:
                 from math import radians, sin, cos, sqrt, atan2
                 R = 6371.0
-                dlat = radians(reference_lat - gps_lat)
-                dlon = radians(reference_lon - gps_lon)
-                a = sin(dlat/2)**2 + cos(radians(gps_lat))*cos(radians(reference_lat))*sin(dlon/2)**2
-                c = 2*atan2(sqrt(a), sqrt(1-a))
+                dlat = radians(ref_lat - lat)
+                dlon = radians(ref_lon - lon)
+                a = sin(dlat/2)**2 + cos(radians(lat))*cos(radians(ref_lat))*sin(dlon/2)**2
+                c = 2 * atan2(sqrt(a), sqrt(1-a))
                 distance_km = R * c
-                flag = "abnormal" if distance_km > 1 else "normal"  # eşik 1 km
+                flag = "abnormal" if distance_km > 1 else "normal"  # 1 km threshold
 
-            row = GPSData(
-                user_id=user.id,
-                filename=file.filename,
-                latitude=gps_lat,
-                longitude=gps_lon,
-                distance_km=distance_km,
-                flag=flag,
-                taken_at=taken_at
-            )
-            db.add(row)
-            saved += 1
+        # Persist (even when GPS is missing, so you can see which file lacked GPS)
+        row = GPSData(
+            user_id=user.id,
+            filename=up.filename,
+            latitude=lat,
+            longitude=lon,
+            distance_km=distance_km,
+            flag=flag,
+            taken_at=taken_at
+        )
+        db.add(row)
+        saved += 1
 
-            items.append({
-                "user_id": external_user_id,
-                "filename": file.filename,
-                "latitude": gps_lat,
-                "longitude": gps_lon,
-                "distance_km": distance_km,
-                "flag": flag,
-                "taken_at": taken_at.isoformat() if taken_at else None
-            })
-        except Exception as e:
-            items.append({
-                "user_id": external_user_id,
-                "filename": getattr(file, "filename", None),
-                "error": str(e)
-            })
+        items.append({
+            "user_id": external_user_id,
+            "filename": up.filename,
+            "latitude": lat,
+            "longitude": lon,
+            "distance_km": distance_km,
+            "flag": flag,
+            "taken_at": taken_at.isoformat() if taken_at else None
+        })
 
     db.commit()
-    return {"status": "ok", "saved": saved, "items": items}
+    return {
+        "status": "ok",
+        "saved": saved,
+        "reference": {
+            "filename": ref_file.filename,
+            "lat": ref_lat,
+            "lon": ref_lon,
+            "taken_at": ref_taken_at.isoformat() if ref_taken_at else None
+        },
+        "items": items
+    }
 
 # ----------------- Feature Snapshot -----------------
 @app.get("/api/v1/users/{external_user_id}/features")
