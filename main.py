@@ -42,49 +42,48 @@ async def ingest_gps(
     - Uses the **first** image as the reference; distance for all other images
       is computed **relative to the first image**, not hop-to-hop.
     - If the **first** image has no GPS, raise 400.
-    - Marks a record as 'abnormal' if distance_km > 500 (simple rule).
+    - Marks a record as 'abnormal' if distance_km > 1 km,
+      otherwise 'normal' (if GPS present).
     - Persists all processed images to DB.
 
     Auth: Bearer token required. The token subject (sub) must match `user_id`.
     """
-    # Enforce per-user access
     if current_user["sub"] != user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden for this user")
 
-    # Ensure user exists (create if needed)
     user = get_or_create_user(db, user_id)
 
     if not files or len(files) == 0:
         raise HTTPException(status_code=400, detail="No files were uploaded")
 
-    # --- 1) First image must have GPS ---
     first_file = files[0]
     first_coords = extract_gps_pillow(first_file)
     if not first_coords:
         raise HTTPException(status_code=400, detail="No GPS data in the FIRST image")
 
     ref_lat, ref_lon = first_coords
-
     results = []
 
-    # Rewind first file pointer after reading EXIF (safety)
     try:
         first_file.file.seek(0)
     except Exception:
         pass
 
-    # --- 2) Process each file; distance to FIRST image ---
+    THRESHOLD_KM = 1.0
+
     for idx, up in enumerate(files):
-        # extract (each file might or might not have GPS)
         coords = extract_gps_pillow(up)
         if coords:
             lat, lon = coords
             if idx == 0:
                 distance_km = 0.0
-                flag = None
+                flag = "normal"
             else:
                 distance_km = haversine_distance(ref_lat, ref_lon, lat, lon)
-                flag = "abnormal" if (distance_km is not None and distance_km > 500) else None
+                if distance_km is not None and distance_km > THRESHOLD_KM:
+                    flag = "abnormal"
+                else:
+                    flag = "normal"
         else:
             lat = lon = None
             distance_km = None
@@ -99,7 +98,10 @@ async def ingest_gps(
             flag=flag,
         )
         db.add(row)
-        db.flush()  # get row.id before commit
+        db.flush()
+
+        pretty_distance = round(distance_km, 2) if distance_km is not None else None
+
         results.append(
             {
                 "index": idx,
@@ -107,7 +109,7 @@ async def ingest_gps(
                 "filename": up.filename,
                 "latitude": lat,
                 "longitude": lon,
-                "distance_km": distance_km,
+                "distance_km": pretty_distance,
                 "flag": flag,
             }
         )
@@ -128,14 +130,12 @@ async def ingest_gps(
 
 # -------------------------- Scoring helpers -------------------------
 def score_gps(feat: Dict[str, Any] | None) -> int:
-    """Very simple GPS rule: penalize abnormal jumps, reward otherwise."""
     if not feat:
         return 0
     return -5 if feat.get("flag") == "abnormal" else 10
 
 
 def decision_from_score(total: int) -> str:
-    """Map total score to a decision label."""
     if total >= 10:
         return "approve"
     if total >= 0:
@@ -163,21 +163,13 @@ def compute_score(
     db: Session = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """
-    Compute a credit score using GPS-derived features only (Phase 3 focus).
-
-    Auth: Bearer token required. The token subject (sub) must match `payload.user_id`.
-    """
-    # Enforce per-user access
     if current_user["sub"] != payload.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden for this user")
 
-    # Locate the user
     user = db.query(User).filter(User.user_id == payload.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Use the latest GPS record as our feature source
     latest_gps = (
         db.query(GPSData)
         .filter(GPSData.user_id == user.id)
@@ -189,7 +181,6 @@ def compute_score(
     total = gps_s
     decision = decision_from_score(total)
 
-    # Upsert by (user_id, loan_id): idempotent writes for the same application
     existing = (
         db.query(CreditScore)
         .filter(CreditScore.user_id == user.id, CreditScore.loan_id == payload.loan_id)
