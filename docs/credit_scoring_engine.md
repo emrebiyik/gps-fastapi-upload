@@ -1,25 +1,22 @@
 # Credit Scoring Engine
 
-## Purpose
-Implements the hybrid scoring model for healthcare financing decisions.  
-Combines **rule-based logic** with **ML-based predictions**.
+## Overview
+The engine computes credit scores based solely on GPS-derived features (Phase 3 scope).
 
-## Inputs
-- Bank Data (39 metrics)
-- Mobile Money Transactions
-- Call Logs
-- Demographic Data
-- Previous Loan History
+## Rules
+- If latest GPS record has:
+  - `flag = "abnormal"` → -5 points
+  - `flag = "normal"` → +10 points
+  - `flag = "no_gps"` → +0 points
 
-## Outputs
-- Credit score (0-1000)
-- Decision: APPROVED / REJECTED / REVIEW
+## Decision Thresholds
+- Score ≥ 10 → **approve**
+- Score ≥ 0 → **review**
+- Score < 0 → **deny**
 
-## Architecture
-- Rule Engine (Python)
-- ML Model (Logistic Regression / XGBoost)
-- Integrated via FastAPI
+## Endpoint
+`POST /api/v1/score/compute`
 
-## Endpoints
-- `POST /score` → Compute credit score
-- `GET /score/{user_id}` → Retrieve score
+### Request
+```json
+{ "user_id": "USER123", "loan_id": "LOAN-2025-0001" }

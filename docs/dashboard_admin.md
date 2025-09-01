@@ -1,16 +1,21 @@
-# Admin Dashboard
+# Dashboard (Admin)
+
+## Overview
+The admin dashboard provides visibility into:
+- User profiles
+- Uploaded GPS data
+- Credit score decisions
 
 ## Features
-- View all users and their scores
-- Search and filter by name, score range, or decision
-- Export data to CSV/Excel
-- Manage flagged cases
+- **User List** → shows `user_id`, created date.
+- **GPS Records** → displays filename, coordinates, distance (rounded 2 decimals), flag.
+- **Flags**:
+  - `"normal"` → distance ≤ 1 km
+  - `"abnormal"` → distance > 1 km
+  - `"no_gps"` → EXIF missing
+- **Credit Scores** → latest decision and score per `(user_id, loan_id)`.
 
-## Tech Stack
-- Frontend: React + Tailwind
-- Backend: FastAPI
-- Authentication: JWT
-
-## User Roles
-- **Admin:** Full access
-- **Reviewer:** Can only view and comment
+## Actions
+- Filter by `user_id` or `loan_id`
+- Review abnormal GPS jumps
+- Export results for auditing
