@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,13 +31,19 @@ app.include_router(auth_router)
 @app.post("/api/v1/gps/ingest")
 async def ingest_gps(
     user_id: str,
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(..., description="One or more images"),
     db: Session = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Extract GPS from an uploaded image (EXIF), compute hop distance from last point,
-    mark suspicious jumps, and persist to DB.
+    MULTI-FILE VERSION
+    - Accepts one or more images (multipart/form-data).
+    - Extracts GPS (EXIF) for each image.
+    - Uses the **first** image as the reference; distance for all other images
+      is computed **relative to the first image**, not hop-to-hop.
+    - If the **first** image has no GPS, raise 400.
+    - Marks a record as 'abnormal' if distance_km > 500 (simple rule).
+    - Persists all processed images to DB.
 
     Auth: Bearer token required. The token subject (sub) must match `user_id`.
     """
@@ -48,46 +54,76 @@ async def ingest_gps(
     # Ensure user exists (create if needed)
     user = get_or_create_user(db, user_id)
 
-    # Extract coordinates
-    coords = extract_gps_pillow(file)
-    if not coords:
-        raise HTTPException(status_code=400, detail="No GPS data found in image EXIF")
+    if not files or len(files) == 0:
+        raise HTTPException(status_code=400, detail="No files were uploaded")
 
-    latitude, longitude = coords
-    filename = file.filename
+    # --- 1) First image must have GPS ---
+    first_file = files[0]
+    first_coords = extract_gps_pillow(first_file)
+    if not first_coords:
+        raise HTTPException(status_code=400, detail="No GPS data in the FIRST image")
 
-    # Get last GPS point for distance calculation
-    last_gps = (
-        db.query(GPSData)
-        .filter(GPSData.user_id == user.id)
-        .order_by(GPSData.id.desc())
-        .first()
-    )
+    ref_lat, ref_lon = first_coords
 
-    distance_km = None
-    flag = None
-    if last_gps and last_gps.latitude is not None and last_gps.longitude is not None:
-        distance_km = haversine_distance(
-            last_gps.latitude, last_gps.longitude, latitude, longitude
+    results = []
+
+    # Rewind first file pointer after reading EXIF (safety)
+    try:
+        first_file.file.seek(0)
+    except Exception:
+        pass
+
+    # --- 2) Process each file; distance to FIRST image ---
+    for idx, up in enumerate(files):
+        # extract (each file might or might not have GPS)
+        coords = extract_gps_pillow(up)
+        if coords:
+            lat, lon = coords
+            if idx == 0:
+                distance_km = 0.0
+                flag = None
+            else:
+                distance_km = haversine_distance(ref_lat, ref_lon, lat, lon)
+                flag = "abnormal" if (distance_km is not None and distance_km > 500) else None
+        else:
+            lat = lon = None
+            distance_km = None
+            flag = "no_gps"
+
+        row = GPSData(
+            user_id=user.id,
+            filename=up.filename,
+            latitude=lat,
+            longitude=lon,
+            distance_km=distance_km,
+            flag=flag,
         )
-        # Simple anomaly rule — adjust threshold as needed
-        if distance_km is not None and distance_km > 500:
-            flag = "abnormal"
+        db.add(row)
+        db.flush()  # get row.id before commit
+        results.append(
+            {
+                "index": idx,
+                "gps_id": row.id,
+                "filename": up.filename,
+                "latitude": lat,
+                "longitude": lon,
+                "distance_km": distance_km,
+                "flag": flag,
+            }
+        )
 
-    # Persist
-    gps_row = GPSData(
-        user_id=user.id,
-        filename=filename,
-        latitude=latitude,
-        longitude=longitude,
-        distance_km=distance_km,
-        flag=flag,
-    )
-    db.add(gps_row)
     db.commit()
-    db.refresh(gps_row)
 
-    return {"status": "ok", "gps_id": gps_row.id, "flag": flag, "distance_km": distance_km}
+    return {
+        "status": "ok",
+        "user_id": user_id,
+        "reference": {
+            "filename": files[0].filename,
+            "latitude": ref_lat,
+            "longitude": ref_lon,
+        },
+        "items": results,
+    }
 
 
 # -------------------------- Scoring helpers -------------------------
