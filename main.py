@@ -17,15 +17,15 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# --- Auth (must match your updated auth.py) ---
+# --- Auth (matches your auth.py) ---
 from auth import router as auth_router, get_current_user
 
-# --- Utils (adapt names if yours differ) ---
-# extract_gps_pillow: UploadFile -> (lat, lon) | None  (may be sync OR async)
-# haversine_distance: (lat1, lon1, lat2, lon2) -> float (km)
-# score_calllogs_from_csv: accepts UploadFile OR file-like (may be sync OR async)
-from utils import extract_gps_pillow, haversine_distance, score_calllogs_from_csv
-
+# --- Utils (keep names in sync with your utils.py) ---
+from utils import (
+    extract_gps_pillow,     # UploadFile -> (lat, lon) | None  (may be sync/async)
+    haversine_distance,     # (lat1, lon1, lat2, lon2) -> float (km)
+    score_calllogs_from_csv # (io.TextIOBase) -> dict or tuple  (may be sync/async)
+)
 
 # ============================================================
 # App & CORS
@@ -43,7 +43,6 @@ app.add_middleware(
 # /auth/token
 app.include_router(auth_router)
 
-
 # ============================================================
 # Schemas
 # ============================================================
@@ -51,7 +50,6 @@ class GPSReference(BaseModel):
     filename: str
     latitude: float
     longitude: float
-
 
 class GPSItem(BaseModel):
     index: int
@@ -62,13 +60,11 @@ class GPSItem(BaseModel):
     distance_km: float
     flag: Optional[str] = None  # "normal" | "abnormal" | "no_gps"
 
-
 class GPSIngestResult(BaseModel):
     status: str = "ok"
     user_id: str
     reference: GPSReference
     items: List[GPSItem]
-
 
 class ScoreOut(BaseModel):
     loan_id: str
@@ -77,14 +73,12 @@ class ScoreOut(BaseModel):
     awarded: Dict[str, Any]
     details: Dict[str, Any]
 
-
 # ============================================================
 # Settings
 # ============================================================
 ABNORMAL_THRESHOLD_KM = float(os.getenv("GPS_ABNORMAL_KM", "1.0"))
 APPROVE_MIN = float(os.getenv("APPROVE_MIN", "60"))
-REVIEW_MIN = float(os.getenv("REVIEW_MIN", "40"))
-
+REVIEW_MIN  = float(os.getenv("REVIEW_MIN",  "40"))
 
 # ============================================================
 # Helpers
@@ -93,16 +87,14 @@ def _caller_id(current_user: dict) -> str:
     """Support both {'sub': ...} and {'username': ...} from auth."""
     return current_user.get("sub") or current_user.get("username") or ""
 
-
-async def _maybe_await(value):
+async def maybe_await(value):
     """Await a coroutine if needed; otherwise return the value."""
     return await value if hasattr(value, "__await__") else value
-
 
 async def _extract_first_gps(file: UploadFile) -> Tuple[float, float]:
     """Read EXIF GPS from first image; raise 400 if missing or unreadable."""
     try:
-        latlon = await _maybe_await(extract_gps_pillow(file))
+        latlon = await maybe_await(extract_gps_pillow(file))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read EXIF GPS: {e}")
     if not latlon:
@@ -110,11 +102,10 @@ async def _extract_first_gps(file: UploadFile) -> Tuple[float, float]:
     lat, lon = latlon
     return float(lat), float(lon)
 
-
 async def _extract_gps_optional(file: UploadFile) -> Optional[Tuple[float, float]]:
     """Read EXIF GPS; return None instead of raising."""
     try:
-        latlon = await _maybe_await(extract_gps_pillow(file))
+        latlon = await maybe_await(extract_gps_pillow(file))
         if not latlon:
             return None
         lat, lon = latlon
@@ -122,14 +113,12 @@ async def _extract_gps_optional(file: UploadFile) -> Optional[Tuple[float, float
     except Exception:
         return None
 
-
 # ============================================================
 # Routes
 # ============================================================
 @app.get("/health", tags=["default"])
 def health() -> Dict[str, str]:
     return {"status": "ok"}
-
 
 @app.post(
     "/users/{user_id}/images",
@@ -145,18 +134,16 @@ async def upload_images_for_gps(
     """
     Ingest images, extract EXIF GPS, compute distance from the FIRST image.
     - Distances are relative to the first image (not hop-to-hop).
-    - If the first image has no GPS -> 400.
+    - If first image has no GPS -> 400.
     - Flag 'abnormal' if distance_km > GPS_ABNORMAL_KM (default 1 km).
     - If any image has no GPS -> flag 'no_gps', distance 0.
     """
     caller = _caller_id(current_user)
     if user_id != caller:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: user mismatch")
-
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
-    # Baseline (first image)
     first = files[0]
     ref_lat, ref_lon = await _extract_first_gps(first)
     reference = GPSReference(filename=first.filename, latitude=ref_lat, longitude=ref_lon)
@@ -173,7 +160,6 @@ async def upload_images_for_gps(
         )
     ]
 
-    # Others relative to first
     for idx, up in enumerate(files[1:], start=1):
         latlon = await _extract_gps_optional(up)
         if not latlon:
@@ -195,7 +181,6 @@ async def upload_images_for_gps(
             dist_km = float(haversine_distance(ref_lat, ref_lon, lat, lon))
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to compute distance: {e}")
-        flag = "abnormal" if dist_km > ABNORMAL_THRESHOLD_KM else "normal"
 
         items.append(
             GPSItem(
@@ -205,12 +190,11 @@ async def upload_images_for_gps(
                 latitude=lat,
                 longitude=lon,
                 distance_km=dist_km,
-                flag=flag,
+                flag="abnormal" if dist_km > ABNORMAL_THRESHOLD_KM else "normal",
             )
         )
 
     return GPSIngestResult(user_id=user_id, reference=reference, items=items)
-
 
 @app.post(
     "/users/{user_id}/score/calllogs",
@@ -226,9 +210,12 @@ async def score_from_calllogs_csv_endpoint(
 ):
     """
     Compute a rule-based credit score using the uploaded CallLogs CSV.
-    - Reads UploadFile asynchronously (await file.read()).
-    - Accepts either async or sync scoring utilities.
-    - Returns 400 with a clear message for user errors (invalid CSV, empty file).
+
+    IMPORTANT:
+    - We ALWAYS read the UploadFile with `await` and pass a **StringIO text stream**
+      into your scoring util to avoid 'coroutine was never awaited' issues.
+    - The util may be sync or async; both are handled.
+    - User mistakes return 400 (not 500).
     """
     caller = _caller_id(current_user)
     if user_id != caller:
@@ -237,36 +224,30 @@ async def score_from_calllogs_csv_endpoint(
     if calllogs_csv is None:
         raise HTTPException(status_code=400, detail="Missing calllogs_csv")
 
-    # Read the uploaded CSV (ASYNC) and normalize to a text stream
+    # 1) Read upload ASYNC, decode, wrap in StringIO
     try:
-        content: bytes = await calllogs_csv.read()  # <-- important: await!
-        if not content:
+        raw: bytes = await calllogs_csv.read()  # <-- this removes the Render warning
+        if not raw:
             raise HTTPException(status_code=400, detail="CSV file is empty")
-        text = content.decode("utf-8", errors="replace")
-        text_stream = io.StringIO(text)
-        # If some downstream code seeks, do a safe seek on our StringIO (sync)
-        text_stream.seek(0)
+        text = raw.decode("utf-8", errors="replace")
+        stream = io.StringIO(text)
+        stream.seek(0)  # safe for any downstream 'seek'
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
 
-    # Call your scoring util; support both UploadFile and file-like,
-    # and both async and sync implementations.
+    # 2) Call your util with the **sync file-like** (never pass UploadFile)
     try:
-        # Try with UploadFile first (some utils accept it directly)
-        maybe = score_calllogs_from_csv(calllogs_csv)
-        result = await _maybe_await(maybe)
-        if not result:
-            # Fallback: try with file-like stream
-            maybe2 = score_calllogs_from_csv(text_stream)
-            result = await _maybe_await(maybe2)
+        result = await maybe_await(score_calllogs_from_csv(stream))
     except HTTPException:
         raise
     except Exception as e:
+        # If your util itself expects a string and tries splitlines on a coroutine,
+        # this keeps the error readable for Swagger users.
         raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
 
-    # Normalize result into our response model
+    # 3) Normalize output (dict OR tuple supported)
     if isinstance(result, dict):
         score = float(result.get("score"))
         decision = str(result.get("decision") or "")
@@ -282,7 +263,7 @@ async def score_from_calllogs_csv_endpoint(
         except Exception:
             raise HTTPException(status_code=400, detail="Unexpected scoring output format")
 
-    # Fallback decision thresholds (if util returned only a score)
+    # 4) Fallback decision thresholds if util returned only a score
     if not decision:
         if score >= APPROVE_MIN:
             decision = "APPROVE"
