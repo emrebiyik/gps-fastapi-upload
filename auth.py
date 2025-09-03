@@ -1,90 +1,82 @@
+# auth.py
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import jwt, JWTError
-from passlib.context import CryptContext
 import os
+from typing import Dict, Any, Optional
 
-# ------------------------------------------------------------------------------
-# Settings
-# ------------------------------------------------------------------------------
-SECRET_KEY = os.getenv("SECRET_KEY", "change-this-in-production")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+from fastapi import APIRouter, Depends, HTTPException, status, Form
+from fastapi.security import APIKeyHeader
+from jose import JWTError, jwt
 
-# OAuth2 scheme (the /auth/token endpoint is declared below)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+# ---------------- Config ----------------
+SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE_ME_SUPER_SECRET")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# ------------------------------------------------------------------------------
-# Fake user store for demo/testing
-# In production, replace with DB-backed users table.
-# Keys are usernames; we use the same value as external_user_id for simplicity.
-# ------------------------------------------------------------------------------
-def _hash(p: str) -> str:
-    return pwd_context.hash(p)
-
-FAKE_USERS_DB: Dict[str, Dict[str, Any]] = {
-    "USER123": {"username": "USER123", "hashed_password": _hash("secret123")},
+# Demo users (example)
+FAKE_USERS_DB = {
+    "USER123": "secret123",
+    "emre": "secret",
 }
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+router = APIRouter(prefix="/auth", tags=["auth"])
 
-def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
-    user = FAKE_USERS_DB.get(username)
-    if not user:
-        return None
-    if not verify_password(password, user["hashed_password"]):
-        return None
-    return user
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+# -------------- Token helpers --------------
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# ------------------------------------------------------------------------------
-# Public API
-# ------------------------------------------------------------------------------
-router = APIRouter(prefix="/auth", tags=["auth"])
+# -------------- Login endpoint (issues token) --------------
+@router.post("/token", summary="Login For Access Token")
+def login_for_access_token(
+    username: str = Form(...),
+    password: str = Form(...),
+    grant_type: Optional[str] = Form(None),
+    scope: Optional[str] = Form(None),
+    client_id: Optional[str] = Form(None),
+    client_secret: Optional[str] = Form(None),
+):
+    real_pwd = FAKE_USERS_DB.get(username)
+    if real_pwd is None or real_pwd != password:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": username})
+    return {"access_token": access_token, "token_type": "bearer"}
 
-@router.post("/token")
-def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    OAuth2 password flow.
-    - username: should match external_user_id
-    - password: stored in FAKE_USERS_DB for demo
-    """
-    user = authenticate_user(form_data.username, form_data.password)
-    if not user:
+# -------------- Swagger API Key (Authorization header) --------------
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+def _extract_bearer_token(auth_header: Optional[str]) -> str:
+    if not auth_header:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
+            status_code=401,
+            detail="Missing Authorization header",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    token = create_access_token({"sub": user["username"]})
-    return {"access_token": token, "token_type": "bearer"}
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail='Authorization must start with "Bearer "',
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return auth_header.split(" ", 1)[1].strip()
 
-# Dependency to use in protected endpoints
-def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def _decode_token(token: str) -> Dict[str, Any]:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")  # we use "sub" as external_user_id
-        if username is None:
-            raise credentials_exception
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError:
-        raise credentials_exception
-    user = FAKE_USERS_DB.get(username)
-    if user is None:
-        raise credentials_exception
-    return {"sub": username}  # minimal identity object
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+def get_current_user(auth_header: Optional[str] = Depends(api_key_header)) -> Dict[str, Any]:
+    token = _extract_bearer_token(auth_header)
+    payload = _decode_token(token)
+    sub = payload.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Token missing 'sub'")
+    if sub not in FAKE_USERS_DB:
+        raise HTTPException(status_code=401, detail="User not found")
+    return {"username": sub}

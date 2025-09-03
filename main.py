@@ -29,7 +29,7 @@ app.add_middleware(
 )
 
 # --------------------------- Routers --------------------------------
-app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(auth_router)
 
 # --------------------------- Schemas --------------------------------
 class ScoreOut(BaseModel):
