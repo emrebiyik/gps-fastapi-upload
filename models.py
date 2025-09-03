@@ -1,34 +1,21 @@
 from datetime import datetime
 from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    Float,
-    DateTime,
-    ForeignKey,
-    JSON,
-    UniqueConstraint,
-    Index,
+    Column, Integer, String, Float, DateTime, ForeignKey, JSON, UniqueConstraint, Index
 )
 from sqlalchemy.orm import relationship
 from database import Base
 
-
 class User(Base):
     __tablename__ = "users"
-
     id = Column(Integer, primary_key=True, index=True)
-    # 🔹 business identity for your user (matches token sub & API user_id)
-    user_id = Column(String, unique=True, index=True, nullable=False)
+    user_id = Column(String, unique=True, index=True, nullable=False)  # external identity (auth 'sub')
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    gps_data = relationship("GPSData", back_populates="user")
-    credit_scores = relationship("CreditScore", back_populates="user")
-
+    gps_data = relationship("GPSData", back_populates="user", cascade="all, delete-orphan")
+    credit_scores = relationship("CreditScore", back_populates="user", cascade="all, delete-orphan")
 
 class GPSData(Base):
     __tablename__ = "gps_data"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     filename = Column(String, nullable=True)
@@ -41,14 +28,12 @@ class GPSData(Base):
 
     user = relationship("User", back_populates="gps_data")
 
-
 class CreditScore(Base):
     __tablename__ = "credit_scores"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
-    loan_id = Column(String, index=True, nullable=False)  # 🔹 application identity
-    score = Column(Integer, nullable=False)
+    loan_id = Column(String, index=True, nullable=False)  # application identity
+    score = Column(Integer, nullable=False)               # stored as int
     decision = Column(String, nullable=False)
     explanation_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
