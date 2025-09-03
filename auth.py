@@ -79,5 +79,5 @@ def get_current_user(auth_header: Optional[str] = Depends(api_key_header)) -> Di
         raise HTTPException(status_code=401, detail="Token missing 'sub'")
     if sub not in FAKE_USERS_DB:
         raise HTTPException(status_code=401, detail="User not found")
-    # ✅ return both keys to stay 100% compatible with existing code
+    # return BOTH to satisfy any existing code that expects "sub"
     return {"sub": sub, "username": sub}
