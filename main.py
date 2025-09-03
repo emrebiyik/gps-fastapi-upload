@@ -189,7 +189,7 @@ async def upload_images_for_gps(
                 filename=up.filename,
                 latitude=lat,
                 longitude=lon,
-                distance_km=dist_km,
+                distance_km=round(dist_km, 2),
                 flag="abnormal" if dist_km > ABNORMAL_THRESHOLD_KM else "normal",
             )
         )
