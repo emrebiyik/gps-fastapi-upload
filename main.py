@@ -1,9 +1,10 @@
 # main.py
 from __future__ import annotations
-from datetime import datetime
 
 import io
 import os
+import csv
+from datetime import datetime, timezone  # <-- timezone üstte
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
 
@@ -316,13 +317,117 @@ async def score_from_calllogs_csv_endpoint(
         details=details,
     )
 
+# ---------------- GPS CSV scoring ----------------
+@app.post(
+    "/users/{user_id}/score/gps_csv",
+    response_model=ScoreOut,
+    tags=["scoring"],
+    summary="Score From GPS CSV"
+)
+async def score_from_gps_csv_endpoint(
+    user_id: str,
+    loan_id: str = Form(..., description="Loan/application id"),
+    gps_csv: UploadFile = File(..., description="CSV with columns: ts, lat, lon, [city], [country]"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Accepts a CSV file of GPS points and computes the GPS-only score.
+    Expected headers (case-insensitive):
+      - ts        : ISO8601 (e.g. 2025-09-01T12:34:56Z) or epoch ms
+      - lat, lon  : floats
+      - city      : optional
+      - country   : optional (ISO alpha-2 or name)
+    """
+    caller = _caller_id(current_user)
+    if user_id != caller:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: user mismatch")
+
+    if gps_csv is None:
+        raise HTTPException(status_code=400, detail="Missing gps_csv")
+
+    # read file -> text
+    try:
+        raw: bytes = await gps_csv.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="CSV file is empty")
+        text = raw.decode("utf-8", errors="replace")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
+
+    # parse CSV -> List[GPSPointIn]
+    def _parse_ts(s: str) -> datetime:
+        s = (s or "").strip()
+        # epoch ms?
+        if s.isdigit():
+            try:
+                ms = int(s)
+                return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+            except Exception:
+                pass
+        # ISO8601
+        try:
+            if s.endswith("Z"):
+                s = s.replace("Z", "+00:00")
+            return datetime.fromisoformat(s)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid timestamp: {s}")
+
+    try:
+        rows = list(csv.DictReader(text.splitlines()))
+        if not rows:
+            raise HTTPException(status_code=400, detail="CSV has no rows")
+        points: List[GPSPointIn] = []
+        for r in rows:
+            ts_raw = r.get("ts") or r.get("timestamp") or r.get("time")
+            lat_raw = r.get("lat") or r.get("latitude")
+            lon_raw = r.get("lon") or r.get("longitude") or r.get("lng")
+            if ts_raw is None or lat_raw is None or lon_raw is None:
+                continue  # skip incomplete row
+            ts = _parse_ts(str(ts_raw))
+            try:
+                lat = float(str(lat_raw))
+                lon = float(str(lon_raw))
+            except Exception:
+                continue
+            city = r.get("city") or None
+            country = r.get("country") or None
+            points.append(GPSPointIn(ts=ts, lat=lat, lon=lon, city=city, country=country))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
+
+    # compute score (reuse existing logic)
+    result = await compute_gps_score_async(points)
+
+    # map to ScoreOut
+    gps_score = float(result.get("gps_score", 0))
+    if gps_score >= APPROVE_MIN:
+        decision = "APPROVE"
+    elif gps_score >= REVIEW_MIN:
+        decision = "REVIEW"
+    else:
+        decision = "REJECT"
+
+    details = result.get("details", {})
+    if "reason" in result:
+        details = {**details, "reason": result["reason"]}
+
+    return ScoreOut(
+        loan_id=loan_id,
+        score=gps_score,
+        decision=decision,
+        awarded={},   # no per-rule breakdown yet
+        details=details,
+    )
+
 # ============================================================
 # GPS-only scoring (JSON input, no DB)
 # ============================================================
-from datetime import datetime, timezone
 from statistics import median
 from math import radians, sin, cos, asin, sqrt
-from fastapi import APIRouter
 
 def _haversine_km_tuple(a: Tuple[float,float], b: Tuple[float,float]) -> float:
     lat1, lon1, lat2, lon2 = map(radians, [a[0], a[1], b[0], b[1]])
@@ -349,7 +454,8 @@ async def _ensure_cities(points: List[GPSPointIn]) -> List[GPSPointIn]:
             enriched.append(p)
             continue
         city, country = await _maybe_reverse_geocode(p.lat, p.lon)
-        enriched.append(GPSPointIn(ts=p.ts, lat=p.lat, lon=p.lon, city=p.city or city, country=p.country or country))
+        enriched.append(GPSPointIn(ts=p.ts, lat=p.lat, lon=p.lon,
+                                   city=p.city or city, country=p.country or country))
     return enriched
 
 def _dominant_city(points: List[GPSPointIn]) -> Optional[str]:
@@ -462,15 +568,7 @@ async def compute_gps_score_async(points: List[GPSPointIn]) -> Dict[str, Any]:
         }
     }
 
-# Router (show under 'scoring' group in Swagger)
-from fastapi import APIRouter
-gps_router = APIRouter(prefix="/gps", tags=["scoring"])
-
-@gps_router.post("/score", summary="Compute GPS-only credit score")
-async def gps_only_score(payload: GPSScoreIn, current_user: dict = Depends(get_current_user)):
-    return await compute_gps_score_async(payload.points)
-
-# Optional: alias under scoring hierarchy
+# ---- Single public endpoint (scoring namespace) ----
 @app.post(
     "/users/{user_id}/score/gps",
     summary="Compute GPS-only credit score (scoring namespace)",
@@ -485,5 +583,3 @@ async def score_gps_under_scoring(
     if user_id != caller:
         raise HTTPException(status_code=403, detail="Forbidden: user mismatch")
     return await compute_gps_score_async(payload.points)
-
-app.include_router(gps_router)
