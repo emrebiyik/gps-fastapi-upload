@@ -1,4 +1,5 @@
 # main.py
+from datetime import datetime
 from __future__ import annotations
 
 import io
@@ -88,7 +89,7 @@ class ScoreOut(BaseModel):
 
 # GPS scoring input models (city/country optional; will be enriched if missing)
 class GPSPointIn(BaseModel):
-    ts: "datetime" = Field(..., description="ISO8601 timestamp with timezone, e.g., 2025-09-01T12:34:56Z")
+    ts: datetime = Field(..., description="ISO8601 timestamp with timezone, e.g., 2025-09-01T12:34:56Z")
     lat: float
     lon: float
     city: Optional[str] = None
