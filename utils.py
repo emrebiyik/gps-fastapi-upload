@@ -1,8 +1,11 @@
+# utils.py
+from __future__ import annotations
+
 import os
 import math
 import csv
 from datetime import datetime
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session
 from models import User
@@ -19,10 +22,23 @@ def get_or_create_user(db: Session, user_id: str) -> User:
     return user
 
 # ------------------------- GPS helpers -------------------------
-def _get_decimal_from_dms(dms, ref):
-    degrees, minutes, seconds = dms
-    decimal = float(degrees) + float(minutes) / 60 + float(seconds) / 3600
-    if ref in ["S", "W"]:
+def _to_float(x) -> float:
+    """Handle PIL EXIF rationals like (num, den) or PIL.Rational."""
+    try:
+        num = getattr(x, "numerator", None)
+        den = getattr(x, "denominator", None)
+        if num is not None and den:
+            return float(num) / float(den)
+        if isinstance(x, (tuple, list)) and len(x) == 2:
+            return float(x[0]) / float(x[1])
+        return float(x)
+    except Exception:
+        return float(x)
+
+def _dms_to_decimal(dms, ref) -> float:
+    d, m, s = (_to_float(dms[0]), _to_float(dms[1]), _to_float(dms[2]))
+    decimal = d + m/60.0 + s/3600.0
+    if ref in ("S", "W"):
         decimal = -decimal
     return decimal
 
@@ -31,6 +47,12 @@ def extract_gps_pillow(file: UploadFile) -> Tuple[float, float] | None:
     Returns (lat, lon) if available, else None.
     """
     try:
+        # Ensure pointer is at start
+        try:
+            file.file.seek(0)
+        except Exception:
+            pass
+
         image = Image.open(file.file)
         exif_data = image._getexif()
         if not exif_data:
@@ -49,13 +71,11 @@ def extract_gps_pillow(file: UploadFile) -> Tuple[float, float] | None:
 
         lat = lon = None
         if "GPSLatitude" in gps_info and "GPSLatitudeRef" in gps_info:
-            lat = _get_decimal_from_dms(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
+            lat = _dms_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
         if "GPSLongitude" in gps_info and "GPSLongitudeRef" in gps_info:
-            lon = _get_decimal_from_dms(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+            lon = _dms_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
 
-        if lat is not None and lon is not None:
-            return (lat, lon)
-        return None
+        return (lat, lon) if (lat is not None and lon is not None) else None
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"GPS extraction failed: {e}")
 
@@ -235,3 +255,24 @@ def score_calllogs_from_csv(file_obj) -> Dict[str, Any]:
         "awarded": awarded,
         "metrics": m,
     }
+
+# ------------------------- Reverse geocoding (optional) -------------------------
+# Install httpx in requirements.txt to use this.
+import httpx
+
+async def reverse_geocode_city(lat: float, lon: float) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Reverse geocode (lat, lon) -> (city, country_code_2letters or None).
+    Uses Nominatim (OSM). Respect their usage policy & rate limits.
+    """
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 10, "addressdetails": 1}
+    headers = {"User-Agent": os.getenv("APP_USER_AGENT", "credit-scoring-api/1.0 (contact: you@example.com)")}
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        r = await client.get(url, params=params, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+    addr = data.get("address", {})
+    city = addr.get("city") or addr.get("town") or addr.get("village")
+    country = addr.get("country_code")
+    return city, (country.upper() if country else None)

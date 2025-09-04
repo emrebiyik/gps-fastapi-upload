@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import os
 from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter
 
 from fastapi import (
     FastAPI,
@@ -12,25 +13,33 @@ from fastapi import (
     UploadFile,
     File,
     Form,
+    Path,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # --- Auth (matches your auth.py) ---
 from auth import router as auth_router, get_current_user
 
-# --- Utils (keep names in sync with your utils.py) ---
+# --- Utils (single source of truth) ---
 from utils import (
-    extract_gps_pillow,     # UploadFile -> (lat, lon) | None  (may be sync/async)
+    extract_gps_pillow,     # UploadFile -> (lat, lon) | None  (sync)
     haversine_distance,     # (lat1, lon1, lat2, lon2) -> float (km)
-    score_calllogs_from_csv # (io.TextIOBase) -> dict or tuple  (may be sync/async)
+    score_calllogs_from_csv # (io.TextIOBase) -> dict (sync)
 )
+
+# Optional reverse geocoding (lat/lon -> city, country)
+try:
+    # signature: async def reverse_geocode_city(lat: float, lon: float) -> Tuple[Optional[str], Optional[str]]
+    from utils import reverse_geocode_city  # type: ignore
+except Exception:
+    reverse_geocode_city = None  # gracefully degrade if not provided
 
 # ============================================================
 # App & CORS
 # ============================================================
-app = FastAPI(title="Credit Scoring API", version="1.1.0")
+app = FastAPI(title="Credit Scoring API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,6 +59,8 @@ class GPSReference(BaseModel):
     filename: str
     latitude: float
     longitude: float
+    city: Optional[str] = None
+    country: Optional[str] = None
 
 class GPSItem(BaseModel):
     index: int
@@ -59,6 +70,8 @@ class GPSItem(BaseModel):
     longitude: float
     distance_km: float
     flag: Optional[str] = None  # "normal" | "abnormal" | "no_gps"
+    city: Optional[str] = None
+    country: Optional[str] = None
 
 class GPSIngestResult(BaseModel):
     status: str = "ok"
@@ -72,6 +85,17 @@ class ScoreOut(BaseModel):
     decision: str
     awarded: Dict[str, Any]
     details: Dict[str, Any]
+
+# GPS scoring input models (city/country optional; will be enriched if missing)
+class GPSPointIn(BaseModel):
+    ts: "datetime" = Field(..., description="ISO8601 timestamp with timezone, e.g., 2025-09-01T12:34:56Z")
+    lat: float
+    lon: float
+    city: Optional[str] = None
+    country: Optional[str] = None
+
+class GPSScoreIn(BaseModel):
+    points: List[GPSPointIn] = Field(..., description="List of GPS points")
 
 # ============================================================
 # Settings
@@ -87,6 +111,9 @@ TRIP_HOP_KM   = float(os.getenv("GPS_TRIP_HOP_KM", "1.0"))
 IMPOSSIBLE_SPEED_KMH = float(os.getenv("GPS_IMPOSSIBLE_SPEED_KMH", "250"))
 MAX_POINTS = int(os.getenv("GPS_MAX_POINTS", "10000"))
 
+# Reverse geocoding toggle
+REVERSE_GEOCODE_ENABLED = os.getenv("REVERSE_GEOCODE_ENABLED", "true").lower() in {"1","true","yes"}
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -94,31 +121,21 @@ def _caller_id(current_user: dict) -> str:
     """Support both {'sub': ...} and {'username': ...} from auth."""
     return current_user.get("sub") or current_user.get("username") or ""
 
-async def maybe_await(value):
-    """Await a coroutine if needed; otherwise return the value."""
-    return await value if hasattr(value, "__await__") else value
-
-async def _extract_first_gps(file: UploadFile) -> Tuple[float, float]:
-    """Read EXIF GPS from first image; raise 400 if missing or unreadable."""
+async def _maybe_reverse_geocode(lat: float, lon: float) -> Tuple[Optional[str], Optional[str]]:
+    """Soft wrapper for reverse geocoding: returns (city, country) or (None, None)."""
+    if not REVERSE_GEOCODE_ENABLED or reverse_geocode_city is None:
+        return (None, None)
     try:
-        latlon = await maybe_await(extract_gps_pillow(file))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read EXIF GPS: {e}")
-    if not latlon:
-        raise HTTPException(status_code=400, detail="First image has no EXIF GPS")
-    lat, lon = latlon
-    return float(lat), float(lon)
-
-async def _extract_gps_optional(file: UploadFile) -> Optional[Tuple[float, float]]:
-    """Read EXIF GPS; return None instead of raising."""
-    try:
-        latlon = await maybe_await(extract_gps_pillow(file))
-        if not latlon:
-            return None
-        lat, lon = latlon
-        return float(lat), float(lon)
+        return await reverse_geocode_city(lat, lon)
     except Exception:
+        return (None, None)
+
+def _mode_or_none(values: List[Optional[str]]) -> Optional[str]:
+    vals = [v for v in values if v]
+    if not vals:
         return None
+    count = Counter(vals)
+    return count.most_common(1)[0][0]
 
 # ============================================================
 # Routes
@@ -127,6 +144,7 @@ async def _extract_gps_optional(file: UploadFile) -> Optional[Tuple[float, float
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
+# ---------------- Image ingest -> GPS + optional city/country ----------------
 @app.post(
     "/users/{user_id}/images",
     response_model=GPSIngestResult,
@@ -140,10 +158,8 @@ async def upload_images_for_gps(
 ):
     """
     Ingest images, extract EXIF GPS, compute distance from the FIRST image.
-    - Distances are relative to the first image (not hop-to-hop).
-    - If first image has no GPS -> 400.
-    - Flag 'abnormal' if distance_km > GPS_ABNORMAL_KM (default 1 km).
-    - If any image has no GPS -> flag 'no_gps', distance 0.
+    Distances are relative to the first image (not hop-to-hop).
+    Adds city/country when reverse geocoder is available.
     """
     caller = _caller_id(current_user)
     if user_id != caller:
@@ -152,8 +168,26 @@ async def upload_images_for_gps(
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     first = files[0]
-    ref_lat, ref_lon = await _extract_first_gps(first)
-    reference = GPSReference(filename=first.filename, latitude=ref_lat, longitude=ref_lon)
+    # extract GPS
+    try:
+        latlon = extract_gps_pillow(first)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read EXIF GPS: {e}")
+    if not latlon:
+        raise HTTPException(status_code=400, detail="First image has no EXIF GPS")
+
+    ref_lat, ref_lon = map(float, latlon)
+    ref_city, ref_country = await _maybe_reverse_geocode(ref_lat, ref_lon)
+
+    reference = GPSReference(
+        filename=first.filename,
+        latitude=ref_lat,
+        longitude=ref_lon,
+        city=ref_city,
+        country=ref_country,
+    )
 
     items: List[GPSItem] = [
         GPSItem(
@@ -164,11 +198,17 @@ async def upload_images_for_gps(
             longitude=ref_lon,
             distance_km=0.0,
             flag="normal",
+            city=ref_city,
+            country=ref_country,
         )
     ]
 
     for idx, up in enumerate(files[1:], start=1):
-        latlon = await _extract_gps_optional(up)
+        try:
+            latlon = extract_gps_pillow(up)
+        except Exception:
+            latlon = None
+
         if not latlon:
             items.append(
                 GPSItem(
@@ -179,15 +219,19 @@ async def upload_images_for_gps(
                     longitude=0.0,
                     distance_km=0.0,
                     flag="no_gps",
+                    city=None,
+                    country=None,
                 )
             )
             continue
 
-        lat, lon = latlon
+        lat, lon = map(float, latlon)
         try:
             dist_km = float(haversine_distance(ref_lat, ref_lon, lat, lon))
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to compute distance: {e}")
+
+        item_city, item_country = await _maybe_reverse_geocode(lat, lon)
 
         items.append(
             GPSItem(
@@ -198,11 +242,14 @@ async def upload_images_for_gps(
                 longitude=lon,
                 distance_km=round(dist_km, 2),
                 flag="abnormal" if dist_km > ABNORMAL_THRESHOLD_KM else "normal",
+                city=item_city,
+                country=item_country,
             )
         )
 
     return GPSIngestResult(user_id=user_id, reference=reference, items=items)
 
+# ---------------- Calllogs CSV scoring ----------------
 @app.post(
     "/users/{user_id}/score/calllogs",
     response_model=ScoreOut,
@@ -215,15 +262,6 @@ async def score_from_calllogs_csv_endpoint(
     calllogs_csv: UploadFile = File(..., description="CallLogs CSV exported from phone"),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Compute a rule-based credit score using the uploaded CallLogs CSV.
-
-    IMPORTANT:
-    - We ALWAYS read the UploadFile with `await` and pass a **StringIO text stream**
-      into your scoring util to avoid 'coroutine was never awaited' issues.
-    - The util may be sync or async; both are handled.
-    - User mistakes return 400 (not 500).
-    """
     caller = _caller_id(current_user)
     if user_id != caller:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: user mismatch")
@@ -231,46 +269,36 @@ async def score_from_calllogs_csv_endpoint(
     if calllogs_csv is None:
         raise HTTPException(status_code=400, detail="Missing calllogs_csv")
 
-    # 1) Read upload ASYNC, decode, wrap in StringIO
+    # Read upload ASYNC, decode, wrap in StringIO
     try:
-        raw: bytes = await calllogs_csv.read()  # <-- this removes the Render warning
+        raw: bytes = await calllogs_csv.read()
         if not raw:
             raise HTTPException(status_code=400, detail="CSV file is empty")
         text = raw.decode("utf-8", errors="replace")
         stream = io.StringIO(text)
-        stream.seek(0)  # safe for any downstream 'seek'
+        stream.seek(0)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
 
-    # 2) Call your util with the **sync file-like** (never pass UploadFile)
+    # Call util with the sync file-like
     try:
-        result = await maybe_await(score_calllogs_from_csv(stream))
+        result = score_calllogs_from_csv(stream)
     except HTTPException:
         raise
     except Exception as e:
-        # If your util itself expects a string and tries splitlines on a coroutine,
-        # this keeps the error readable for Swagger users.
         raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
 
-    # 3) Normalize output (dict OR tuple supported)
+    # Normalize output
     if isinstance(result, dict):
         score = float(result.get("score"))
         decision = str(result.get("decision") or "")
         awarded = result.get("awarded", {}) or {}
-        details = result.get("details", {}) or {}
+        details = result.get("metrics", {}) or result.get("details", {}) or {}
     else:
-        try:
-            score, decision, awarded, details = result  # type: ignore
-            score = float(score)
-            decision = str(decision or "")
-            awarded = awarded or {}
-            details = details or {}
-        except Exception:
-            raise HTTPException(status_code=400, detail="Unexpected scoring output format")
+        raise HTTPException(status_code=400, detail="Unexpected scoring output format")
 
-    # 4) Fallback decision thresholds if util returned only a score
     if not decision:
         if score >= APPROVE_MIN:
             decision = "APPROVE"
@@ -288,24 +316,14 @@ async def score_from_calllogs_csv_endpoint(
     )
 
 # ============================================================
-# GPS-only scoring (self-contained; JSON input, no DB)
+# GPS-only scoring (JSON input, no DB)
 # ============================================================
 from datetime import datetime, timezone
 from statistics import median
 from math import radians, sin, cos, asin, sqrt
 from fastapi import APIRouter
-from pydantic import Field
-class GPSPointIn(BaseModel):
-    ts: datetime = Field(..., description="ISO8601 timestamp with timezone, e.g., 2025-09-01T12:34:56Z")
-    lat: float
-    lon: float
-class GPSScoreIn(BaseModel):
-    points: List[GPSPointIn] = Field(
-        ...,
-        description="List of GPS points"
-    )
 
-def _haversine_km(a: Tuple[float,float], b: Tuple[float,float]) -> float:
+def _haversine_km_tuple(a: Tuple[float,float], b: Tuple[float,float]) -> float:
     lat1, lon1, lat2, lon2 = map(radians, [a[0], a[1], b[0], b[1]])
     dlat, dlon = lat2 - lat1, lon2 - lon1
     r = 6371.0
@@ -320,8 +338,27 @@ def _to_utc(dt: datetime) -> datetime:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
-def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
-    # simple manual validation compatible with pydantic v1/v2
+async def _ensure_cities(points: List[GPSPointIn]) -> List[GPSPointIn]:
+    """Fill city/country for points that miss them (if reverse geocoder is available)."""
+    if not REVERSE_GEOCODE_ENABLED or reverse_geocode_city is None:
+        return points
+    enriched: List[GPSPointIn] = []
+    for p in points:
+        if p.city and p.country:
+            enriched.append(p)
+            continue
+        city, country = await _maybe_reverse_geocode(p.lat, p.lon)
+        enriched.append(GPSPointIn(ts=p.ts, lat=p.lat, lon=p.lon, city=p.city or city, country=p.country or country))
+    return enriched
+
+def _dominant_city(points: List[GPSPointIn]) -> Optional[str]:
+    return _mode_or_none([p.city for p in points])
+
+def _dominant_country(points: List[GPSPointIn]) -> Optional[str]:
+    return _mode_or_none([p.country for p in points])
+
+async def compute_gps_score_async(points: List[GPSPointIn]) -> Dict[str, Any]:
+    # manual validation (pydantic v1/v2 safe)
     if len(points) > MAX_POINTS:
         raise HTTPException(status_code=413, detail=f"Too many points (>{MAX_POINTS})")
     for p in points:
@@ -331,8 +368,14 @@ def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
     if len(points) < 5:
         return {"gps_score": 0, "risk": "High", "reason": "insufficient_gps_data"}
 
+    # Optionally enrich city/country
+    points = await _ensure_cities(points)
+
     # Sort and normalize to UTC
-    pts = sorted((GPSPointIn(ts=_to_utc(p.ts), lat=p.lat, lon=p.lon) for p in points), key=lambda p: p.ts)
+    pts = sorted(
+        (GPSPointIn(ts=_to_utc(p.ts), lat=p.lat, lon=p.lon, city=p.city, country=p.country) for p in points),
+        key=lambda p: p.ts
+    )
 
     # Windows in UTC
     night = [p for p in pts if p.ts.hour >= 22 or p.ts.hour < 6]
@@ -342,7 +385,7 @@ def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
         if len(sub) < 3:
             return 0.0
         c = _centroid([(p.lat, p.lon) for p in sub])
-        within = sum(1 for p in sub if _haversine_km((p.lat,p.lon), c)*1000 <= radius_m)
+        within = sum(1 for p in sub if _haversine_km_tuple((p.lat,p.lon), c)*1000 <= radius_m)
         return within / len(sub)
 
     home_cov = coverage_ratio(night, HOME_RADIUS_M)
@@ -357,20 +400,20 @@ def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
     daily_radii = []
     for coords in by_day.values():
         c = _centroid(coords)
-        dists = [_haversine_km(c, xy) for xy in coords]
+        dists = [_haversine_km_tuple(c, xy) for xy in coords]
         daily_radii.append(max(dists) if dists else 0.0)
     daily_radius_med = median(daily_radii) if daily_radii else 0.0
 
     # Trips normalized by window length (~per week)
     total_hours = (pts[-1].ts - pts[0].ts).total_seconds() / 3600.0
-    trips = sum(1 for a, b in zip(pts, pts[1:]) if _haversine_km((a.lat,a.lon),(b.lat,b.lon)) > TRIP_HOP_KM)
+    trips = sum(1 for a, b in zip(pts, pts[1:]) if _haversine_km_tuple((a.lat,a.lon),(b.lat,b.lon)) > TRIP_HOP_KM)
     trips_per_week = trips if total_hours <= 0 else trips * (24*7) / total_hours
 
     # Impossible jumps
     imp = 0
     for a, b in zip(pts, pts[1:]):
         dt_h = (b.ts - a.ts).total_seconds()/3600.0
-        if dt_h > 0 and (_haversine_km((a.lat,a.lon),(b.lat,b.lon)) / dt_h) > IMPOSSIBLE_SPEED_KMH:
+        if dt_h > 0 and (_haversine_km_tuple((a.lat,a.lon),(b.lat,b.lon)) / dt_h) > IMPOSSIBLE_SPEED_KMH:
             imp += 1
     imp_rate = imp / max(1, len(pts)-1)
 
@@ -395,6 +438,15 @@ def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
     score_rounded = max(0, min(100, round(score, 0)))
     risk = "Low" if score_rounded >= 70 else ("Medium" if score_rounded >= 50 else "High")
 
+    details_extra: Dict[str, Any] = {
+        "home_city": _dominant_city(night),
+        "home_country": _dominant_country(night),
+        "work_city": _dominant_city(work),
+        "work_country": _dominant_country(work),
+        "distinct_cities_last_window": len({p.city for p in pts if p.city}),
+        "distinct_countries_last_window": len({p.country for p in pts if p.country}),
+    }
+
     return {
         "gps_score": score_rounded,
         "risk": risk,
@@ -404,14 +456,33 @@ def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
             "daily_radius_median_km": round(daily_radius_med, 2),
             "trips": int(trips),
             "trips_per_week": round(trips_per_week, 2),
-            "impossible_jump_rate": round(imp_rate, 4)
+            "impossible_jump_rate": round(imp_rate, 4),
+            **details_extra,
         }
     }
 
-gps_router = APIRouter(prefix="/gps", tags=["gps"])
+# Router (show under 'scoring' group in Swagger)
+from fastapi import APIRouter
+gps_router = APIRouter(prefix="/gps", tags=["scoring"])
 
 @gps_router.post("/score", summary="Compute GPS-only credit score")
 async def gps_only_score(payload: GPSScoreIn, current_user: dict = Depends(get_current_user)):
-    return compute_gps_score(payload.points)
+    return await compute_gps_score_async(payload.points)
+
+# Optional: alias under scoring hierarchy
+@app.post(
+    "/users/{user_id}/score/gps",
+    summary="Compute GPS-only credit score (scoring namespace)",
+    tags=["scoring"]
+)
+async def score_gps_under_scoring(
+    user_id: str = Path(..., description="Owner of the points; must match token"),
+    payload: GPSScoreIn = ...,
+    current_user: dict = Depends(get_current_user),
+):
+    caller = _caller_id(current_user)
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Forbidden: user mismatch")
+    return await compute_gps_score_async(payload.points)
 
 app.include_router(gps_router)
