@@ -299,13 +299,10 @@ class GPSPointIn(BaseModel):
     ts: datetime = Field(..., description="ISO8601 timestamp with timezone, e.g., 2025-09-01T12:34:56Z")
     lat: float
     lon: float
-
 class GPSScoreIn(BaseModel):
     points: List[GPSPointIn] = Field(
         ...,
-        description="List of GPS points",
-        min_length=1,
-        max_length=MAX_POINTS
+        description="List of GPS points"
     )
 
 def _haversine_km(a: Tuple[float,float], b: Tuple[float,float]) -> float:
