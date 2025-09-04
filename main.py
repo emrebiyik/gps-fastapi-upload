@@ -80,6 +80,13 @@ ABNORMAL_THRESHOLD_KM = float(os.getenv("GPS_ABNORMAL_KM", "1.0"))
 APPROVE_MIN = float(os.getenv("APPROVE_MIN", "60"))
 REVIEW_MIN  = float(os.getenv("REVIEW_MIN",  "40"))
 
+# --- GPS scoring configurable knobs ---
+HOME_RADIUS_M = int(os.getenv("GPS_HOME_RADIUS_M", "250"))
+WORK_RADIUS_M = int(os.getenv("GPS_WORK_RADIUS_M", "500"))
+TRIP_HOP_KM   = float(os.getenv("GPS_TRIP_HOP_KM", "1.0"))
+IMPOSSIBLE_SPEED_KMH = float(os.getenv("GPS_IMPOSSIBLE_SPEED_KMH", "250"))
+MAX_POINTS = int(os.getenv("GPS_MAX_POINTS", "10000"))
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -279,3 +286,136 @@ async def score_from_calllogs_csv_endpoint(
         awarded=awarded,
         details=details,
     )
+
+# ============================================================
+# GPS-only scoring (self-contained; JSON input, no DB)
+# ============================================================
+from datetime import datetime, timezone
+from statistics import median
+from math import radians, sin, cos, asin, sqrt
+from fastapi import APIRouter
+from pydantic import Field, conlist, validator
+
+class GPSPointIn(BaseModel):
+    ts: datetime = Field(..., description="ISO8601 timestamp with timezone, e.g., 2025-09-01T12:34:56Z")
+    lat: float
+    lon: float
+
+    @validator("lat")
+    def _lat_range(cls, v):
+        if not (-90.0 <= v <= 90.0):
+            raise ValueError("lat must be between -90 and 90")
+        return v
+
+    @validator("lon")
+    def _lon_range(cls, v):
+        if not (-180.0 <= v <= 180.0):
+            raise ValueError("lon must be between -180 and 180")
+        return v
+
+class GPSScoreIn(BaseModel):
+    points: conlist(GPSPointIn, min_items=1, max_items=MAX_POINTS) = Field(..., description="List of GPS points")
+
+def _haversine_km(a: Tuple[float,float], b: Tuple[float,float]) -> float:
+    lat1, lon1, lat2, lon2 = map(radians, [a[0], a[1], b[0], b[1]])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    r = 6371.0
+    h = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return 2 * r * asin(sqrt(h))
+
+def _centroid(points: List[Tuple[float,float]]) -> Tuple[float,float]:
+    return (sum(p[0] for p in points)/len(points), sum(p[1] for p in points)/len(points))
+
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
+    if len(points) < 5:
+        return {"gps_score": 0, "risk": "High", "reason": "insufficient_gps_data"}
+
+    # Sort and normalize to UTC
+    pts = sorted((GPSPointIn(ts=_to_utc(p.ts), lat=p.lat, lon=p.lon) for p in points), key=lambda p: p.ts)
+
+    # Windows in UTC
+    night = [p for p in pts if p.ts.hour >= 22 or p.ts.hour < 6]
+    work  = [p for p in pts if 9 <= p.ts.hour < 18 and p.ts.weekday() < 5]
+
+    def coverage_ratio(sub: List[GPSPointIn], radius_m: int) -> float:
+        if len(sub) < 3:
+            return 0.0
+        c = _centroid([(p.lat, p.lon) for p in sub])
+        within = sum(1 for p in sub if _haversine_km((p.lat,p.lon), c)*1000 <= radius_m)
+        return within / len(sub)
+
+    home_cov = coverage_ratio(night, HOME_RADIUS_M)
+    work_cov = coverage_ratio(work, WORK_RADIUS_M)
+
+    # Daily radius median
+    by_day: Dict[str, List[Tuple[float,float]]] = {}
+    for p in pts:
+        k = p.ts.strftime("%Y-%m-%d")
+        by_day.setdefault(k, []).append((p.lat, p.lon))
+
+    daily_radii = []
+    for coords in by_day.values():
+        c = _centroid(coords)
+        dists = [_haversine_km(c, xy) for xy in coords]
+        daily_radii.append(max(dists) if dists else 0.0)
+    daily_radius_med = median(daily_radii) if daily_radii else 0.0
+
+    # Trips normalized by window length (~per week)
+    total_hours = (pts[-1].ts - pts[0].ts).total_seconds() / 3600.0
+    trips = sum(1 for a, b in zip(pts, pts[1:]) if _haversine_km((a.lat,a.lon),(b.lat,b.lon)) > TRIP_HOP_KM)
+    trips_per_week = trips if total_hours <= 0 else trips * (24*7) / total_hours
+
+    # Impossible jumps
+    imp = 0
+    for a, b in zip(pts, pts[1:]):
+        dt_h = (b.ts - a.ts).total_seconds()/3600.0
+        if dt_h > 0 and (_haversine_km((a.lat,a.lon),(b.lat,b.lon)) / dt_h) > IMPOSSIBLE_SPEED_KMH:
+            imp += 1
+    imp_rate = imp / max(1, len(pts)-1)
+
+    # Scoring
+    score = 0
+    score += 25 if home_cov >= 0.70 else (15 if home_cov >= 0.40 else 5)
+    score += 20 if work_cov >= 0.60 else (10 if work_cov >= 0.30 else 0)
+    score += 15 if daily_radius_med <= 3 else (8 if daily_radius_med <= 10 else 3)
+
+    if 3 <= trips_per_week <= 10:
+        score += 10
+    elif 1 <= trips_per_week <= 2:
+        score += 6
+    elif trips_per_week >= 11:
+        score += 4
+
+    if imp_rate > 0.03:
+        score -= 20
+    elif imp_rate > 0.01:
+        score -= 10
+
+    score_rounded = max(0, min(100, round(score, 0)))
+    risk = "Low" if score_rounded >= 70 else ("Medium" if score_rounded >= 50 else "High")
+
+    return {
+        "gps_score": score_rounded,
+        "risk": risk,
+        "details": {
+            "home_coverage": round(home_cov, 2),
+            "work_coverage": round(work_cov, 2),
+            "daily_radius_median_km": round(daily_radius_med, 2),
+            "trips": int(trips),
+            "trips_per_week": round(trips_per_week, 2),
+            "impossible_jump_rate": round(imp_rate, 4)
+        }
+    }
+
+gps_router = APIRouter(prefix="/gps", tags=["gps"])
+
+@gps_router.post("/score", summary="Compute GPS-only credit score")
+async def gps_only_score(payload: GPSScoreIn, current_user: dict = Depends(get_current_user)):
+    return compute_gps_score(payload.points)
+
+app.include_router(gps_router)
