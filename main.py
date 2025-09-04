@@ -294,24 +294,11 @@ from datetime import datetime, timezone
 from statistics import median
 from math import radians, sin, cos, asin, sqrt
 from fastapi import APIRouter
-from pydantic import Field, conlist, validator
-
+from pydantic import Field
 class GPSPointIn(BaseModel):
     ts: datetime = Field(..., description="ISO8601 timestamp with timezone, e.g., 2025-09-01T12:34:56Z")
     lat: float
     lon: float
-
-    @validator("lat")
-    def _lat_range(cls, v):
-        if not (-90.0 <= v <= 90.0):
-            raise ValueError("lat must be between -90 and 90")
-        return v
-
-    @validator("lon")
-    def _lon_range(cls, v):
-        if not (-180.0 <= v <= 180.0):
-            raise ValueError("lon must be between -180 and 180")
-        return v
 
 class GPSScoreIn(BaseModel):
     points: List[GPSPointIn] = Field(
@@ -337,6 +324,13 @@ def _to_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 def compute_gps_score(points: List[GPSPointIn]) -> Dict[str, Any]:
+    # simple manual validation compatible with pydantic v1/v2
+    if len(points) > MAX_POINTS:
+        raise HTTPException(status_code=413, detail=f"Too many points (>{MAX_POINTS})")
+    for p in points:
+        if not (-90.0 <= p.lat <= 90.0) or not (-180.0 <= p.lon <= 180.0):
+            raise HTTPException(status_code=422, detail="lat/lon out of range")
+
     if len(points) < 5:
         return {"gps_score": 0, "risk": "High", "reason": "insufficient_gps_data"}
 
