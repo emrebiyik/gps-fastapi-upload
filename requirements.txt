@@ -8,4 +8,4 @@ httpx
 python-jose[cryptography]
 passlib[bcrypt]
 python-dotenv
-pydantic
+pydantic<2 

@@ -314,7 +314,12 @@ class GPSPointIn(BaseModel):
         return v
 
 class GPSScoreIn(BaseModel):
-    points: conlist(GPSPointIn, min_items=1, max_items=MAX_POINTS) = Field(..., description="List of GPS points")
+    points: List[GPSPointIn] = Field(
+        ...,
+        description="List of GPS points",
+        min_length=1,
+        max_length=MAX_POINTS
+    )
 
 def _haversine_km(a: Tuple[float,float], b: Tuple[float,float]) -> float:
     lat1, lon1, lat2, lon2 = map(radians, [a[0], a[1], b[0], b[1]])
