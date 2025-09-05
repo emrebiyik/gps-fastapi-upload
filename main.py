@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 import os
 import csv
-from datetime import datetime, timezone  # <-- timezone üstte
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
 
@@ -170,7 +170,6 @@ async def upload_images_for_gps(
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     first = files[0]
-    # extract GPS
     try:
         latlon = extract_gps_pillow(first)
     except HTTPException:
@@ -271,7 +270,6 @@ async def score_from_calllogs_csv_endpoint(
     if calllogs_csv is None:
         raise HTTPException(status_code=400, detail="Missing calllogs_csv")
 
-    # Read upload ASYNC, decode, wrap in StringIO
     try:
         raw: bytes = await calllogs_csv.read()
         if not raw:
@@ -284,7 +282,6 @@ async def score_from_calllogs_csv_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
 
-    # Call util with the sync file-like
     try:
         result = score_calllogs_from_csv(stream)
     except HTTPException:
@@ -292,7 +289,6 @@ async def score_from_calllogs_csv_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
 
-    # Normalize output
     if isinstance(result, dict):
         score = float(result.get("score"))
         decision = str(result.get("decision") or "")
@@ -317,9 +313,9 @@ async def score_from_calllogs_csv_endpoint(
         details=details,
     )
 
-# ---------------- GPS CSV scoring ----------------
+# ---------------- GPS CSV scoring (TEK endpoint) ----------------
 @app.post(
-    "/users/{user_id}/score/gps_csv",
+    "/users/{user_id}/score/gps",
     response_model=ScoreOut,
     tags=["scoring"],
     summary="Score From GPS CSV"
@@ -424,7 +420,7 @@ async def score_from_gps_csv_endpoint(
     )
 
 # ============================================================
-# GPS-only scoring (JSON input, no DB)
+# GPS-only scoring (core logic; JSON list already handled by CSV parser)
 # ============================================================
 from statistics import median
 from math import radians, sin, cos, asin, sqrt
@@ -567,19 +563,3 @@ async def compute_gps_score_async(points: List[GPSPointIn]) -> Dict[str, Any]:
             **details_extra,
         }
     }
-
-# ---- Single public endpoint (scoring namespace) ----
-@app.post(
-    "/users/{user_id}/score/gps",
-    summary="Compute GPS-only credit score (scoring namespace)",
-    tags=["scoring"]
-)
-async def score_gps_under_scoring(
-    user_id: str = Path(..., description="Owner of the points; must match token"),
-    payload: GPSScoreIn = ...,
-    current_user: dict = Depends(get_current_user),
-):
-    caller = _caller_id(current_user)
-    if user_id != caller:
-        raise HTTPException(status_code=403, detail="Forbidden: user mismatch")
-    return await compute_gps_score_async(payload.points)
