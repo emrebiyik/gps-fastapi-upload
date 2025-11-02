@@ -10,19 +10,14 @@ from collections import Counter
 
 from fastapi import (
     FastAPI,
-    Depends,
     HTTPException,
     UploadFile,
     File,
     Form,
-    Path,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-# --- Auth (matches your auth.py) ---
-from auth import router as auth_router, get_current_user
 
 # --- Utils (single source of truth) ---
 from utils import (
@@ -41,7 +36,7 @@ except Exception:
 # ============================================================
 # App & CORS
 # ============================================================
-app = FastAPI(title="Credit Scoring API", version="1.2.0")
+app = FastAPI(title="Credit Scoring API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,9 +45,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# /auth/token
-app.include_router(auth_router)
 
 # ============================================================
 # Schemas
@@ -114,85 +106,17 @@ IMPOSSIBLE_SPEED_KMH = float(os.getenv("GPS_IMPOSSIBLE_SPEED_KMH", "250"))
 MAX_POINTS = int(os.getenv("GPS_MAX_POINTS", "10000"))
 
 # Reverse geocoding toggle
+REVERSE_GEOCODE_ENABLED = os.getenv("REVERSE_GEOCODE_ENABLED", "true").lower() in {"1","true","yes"}
 
-# Combined scoring weights (env override)
-W_GPS = float(os.getenv("W_GPS", "0.6"))
-W_CALL = float(os.getenv("W_CALL", "0.4"))
-
-# Machine Learning toggle & model paths
+# --- ML integration (optional; preserved) ---
 USE_ML = os.getenv("USE_ML", "false").lower() in {"1","true","yes","on","y"}
-ML_BACKEND = os.getenv("ML_BACKEND", "joblib")  # reserved for future
+ML_BACKEND = os.getenv("ML_BACKEND", "joblib")  # reserved for future backends
 MODEL_GPS_PATH = os.getenv("MODEL_GPS_PATH", "models/gps_model.joblib")
 MODEL_CALL_PATH = os.getenv("MODEL_CALL_PATH", "models/calllogs_model.joblib")
-REVERSE_GEOCODE_ENABLED = os.getenv("REVERSE_GEOCODE_ENABLED", "true").lower() in {"1","true","yes"}
 
 # ============================================================
 # Helpers
-
-# ---------------- ML Helpers (optional, safe fallback) ----------------
-_ml_cache = {}
-
-def _ml_load_model(path: str):
-    # Lazy cache
-    if path in _ml_cache:
-        return _ml_cache[path]
-    try:
-        import joblib  # optional dependency
-    except Exception:
-        return None
-    try:
-        model = joblib.load(path)
-        _ml_cache[path] = model
-        return model
-    except Exception:
-        return None
-
-def _vectorize_features(model, feats_dict):
-    # If the model exposes feature_names_in_, align by that; else sorted keys
-    keys = None
-    try:
-        keys = list(model.feature_names_in_)
-    except Exception:
-        keys = sorted(feats_dict.keys())
-    return [float(feats_dict.get(k, 0.0)) for k in keys]
-
-def _ml_predict_score(model_path: str, feats: dict) -> dict | None:
-    """
-    Returns {'score': float in [0,100], 'raw': any} or None if model/dep not available.
-    Accepts classification (predict_proba) or regression models.
-    """
-    model = _ml_load_model(model_path)
-    if model is None:
-        return None
-    X = [_vectorize_features(model, feats)]
-    # Try classification proba -> scale to 0-100 by positive class prob
-    try:
-        proba = model.predict_proba(X)[0]
-        # assume positive class is the last column if labels are [0,1]
-        pos = float(proba[-1])
-        return {"score": max(0.0, min(100.0, 100.0 * pos)), "raw": {"proba": proba}}
-    except Exception:
-        pass
-    # Try decision_function -> map via logistic squashing to 0-100
-    try:
-        import math
-        df = float(model.decision_function(X)[0])
-        prob = 1.0 / (1.0 + math.exp(-df))
-        return {"score": 100.0 * prob, "raw": {"decision_function": df}}
-    except Exception:
-        pass
-    # Try regression -> clamp to [0,100]
-    try:
-        pred = float(model.predict(X)[0])
-        return {"score": max(0.0, min(100.0, pred)), "raw": {"pred": pred}}
-    except Exception:
-        pass
-    return None
 # ============================================================
-def _caller_id(current_user: dict) -> str:
-    """Support both {'sub': ...} and {'username': ...} from auth."""
-    return current_user.get("sub") or current_user.get("username") or ""
-
 async def _maybe_reverse_geocode(lat: float, lon: float) -> Tuple[Optional[str], Optional[str]]:
     """Soft wrapper for reverse geocoding: returns (city, country) or (None, None)."""
     if not REVERSE_GEOCODE_ENABLED or reverse_geocode_city is None:
@@ -208,6 +132,64 @@ def _mode_or_none(values: List[Optional[str]]) -> Optional[str]:
         return None
     count = Counter(vals)
     return count.most_common(1)[0][0]
+
+# ---------------- ML Helpers (optional, safe fallback) ----------------
+_ml_cache: Dict[str, Any] = {}
+
+def _ml_load_model(path: str):
+    # Lazy-loaded model cache. Requires 'joblib' if using scikit-learn models.
+    if path in _ml_cache:
+        return _ml_cache[path]
+    try:
+        import joblib  # optional dependency; add to requirements if using ML
+    except Exception:
+        return None
+    try:
+        model = joblib.load(path)
+        _ml_cache[path] = model
+        return model
+    except Exception:
+        return None
+
+def _vectorize_features(model, feats_dict: Dict[str, Any]) -> List[float]:
+    # Align features to model; prefer feature_names_in_, else sorted keys.
+    try:
+        keys = list(model.feature_names_in_)
+    except Exception:
+        keys = sorted(feats_dict.keys())
+    return [float(feats_dict.get(k, 0.0)) for k in keys]
+
+def _ml_predict_score(model_path: str, feats: Dict[str, Any]):
+    """
+    Returns {'score': float in [0,100], 'raw': any} or None if model unavailable.
+    Supports: classifier (predict_proba / decision_function) or regressor (predict).
+    """
+    model = _ml_load_model(model_path)
+    if model is None:
+        return None
+    X = [_vectorize_features(model, feats)]
+    # 1) Classification with predict_proba -> map positive class prob to 0..100
+    try:
+        proba = model.predict_proba(X)[0]
+        pos = float(proba[-1])  # assume last column is positive class
+        return {"score": max(0.0, min(100.0, 100.0 * pos)), "raw": {"proba": proba}}
+    except Exception:
+        pass
+    # 2) Margin via decision_function -> logistic squash to 0..100
+    try:
+        import math
+        df = float(model.decision_function(X)[0])
+        prob = 1.0 / (1.0 + math.exp(-df))
+        return {"score": 100.0 * prob, "raw": {"decision_function": df}}
+    except Exception:
+        pass
+    # 3) Regression -> clamp to 0..100
+    try:
+        pred = float(model.predict(X)[0])
+        return {"score": max(0.0, min(100.0, pred)), "raw": {"pred": pred}}
+    except Exception:
+        pass
+    return None
 
 # ============================================================
 # Routes
@@ -226,24 +208,18 @@ def health() -> Dict[str, str]:
 async def upload_images_for_gps(
     user_id: str,
     files: List[UploadFile] = File(...),
-    current_user: dict = Depends(get_current_user),
 ):
     """
     Ingest images, extract EXIF GPS, compute distance from the FIRST image.
     Distances are relative to the first image (not hop-to-hop).
     Adds city/country when reverse geocoder is available.
     """
-    caller = _caller_id(current_user)
-    if user_id != caller:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: user mismatch")
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     first = files[0]
     try:
         latlon = extract_gps_pillow(first)
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read EXIF GPS: {e}")
     if not latlon:
@@ -331,12 +307,7 @@ async def score_from_calllogs_csv_endpoint(
     user_id: str,
     loan_id: str = Form(..., description="Loan/application id"),
     calllogs_csv: UploadFile = File(..., description="CallLogs CSV exported from phone"),
-    current_user: dict = Depends(get_current_user),
 ):
-    caller = _caller_id(current_user)
-    if user_id != caller:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: user mismatch")
-
     if calllogs_csv is None:
         raise HTTPException(status_code=400, detail="Missing calllogs_csv")
 
@@ -360,20 +331,31 @@ async def score_from_calllogs_csv_endpoint(
         raise HTTPException(status_code=400, detail=f"Invalid CSV content: {e}")
 
     if isinstance(result, dict):
-        score = float(result.get("score"))
+        score = float(result.get("score", 0.0))
         decision = str(result.get("decision") or "")
         awarded = result.get("awarded", {}) or {}
         details = result.get("metrics", {}) or result.get("details", {}) or {}
-    # Optional ML for CallLogs
-    if USE_ML:
-        _ml_out = _ml_predict_score(MODEL_CALL_PATH, details)
-        if _ml_out and isinstance(_ml_out.get("score"), (int, float)):
-            score = float(_ml_out["score"])
-            details = {**details, "ml": {"enabled": True, "model_path": MODEL_CALL_PATH, "raw": _ml_out.get("raw", {})}}
-        else:
-            details = {**details, "ml": {"enabled": True, "warning": "model not available; using rules"}}
     else:
         raise HTTPException(status_code=400, detail="Unexpected scoring output format")
+
+    # ---- ML Override (preserved) ----
+    if USE_ML:
+        try:
+            _ml_out = _ml_predict_score(MODEL_CALL_PATH, details)
+            if _ml_out and isinstance(_ml_out.get("score"), (int, float)):
+                score = float(_ml_out["score"])
+                details = {
+                    **details,
+                    "ml": {
+                        "enabled": True,
+                        "model_path": MODEL_CALL_PATH,
+                        "raw": _ml_out.get("raw", {}),
+                    },
+                }
+            else:
+                details = {**details, "ml": {"enabled": True, "warning": "model not available; using rules"}}
+        except Exception:
+            details = {**details, "ml": {"enabled": True, "warning": "ml error; using rules"}}
 
     if not decision:
         if score >= APPROVE_MIN:
@@ -391,7 +373,7 @@ async def score_from_calllogs_csv_endpoint(
         details=details,
     )
 
-# ---------------- GPS CSV scoring (TEK endpoint) ----------------
+# ---------------- GPS CSV scoring (SINGLE endpoint) ----------------
 @app.post(
     "/users/{user_id}/score/gps",
     response_model=ScoreOut,
@@ -402,7 +384,6 @@ async def score_from_gps_csv_endpoint(
     user_id: str,
     loan_id: str = Form(..., description="Loan/application id"),
     gps_csv: UploadFile = File(..., description="CSV with columns: ts, lat, lon, [city], [country]"),
-    current_user: dict = Depends(get_current_user),
 ):
     """
     Accepts a CSV file of GPS points and computes the GPS-only score.
@@ -412,10 +393,6 @@ async def score_from_gps_csv_endpoint(
       - city      : optional
       - country   : optional (ISO alpha-2 or name)
     """
-    caller = _caller_id(current_user)
-    if user_id != caller:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: user mismatch")
-
     if gps_csv is None:
         raise HTTPException(status_code=400, detail="Missing gps_csv")
 
@@ -473,23 +450,25 @@ async def score_from_gps_csv_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
 
-    # compute score (reuse existing logic)
+    # compute rule-based score
     result = await compute_gps_score_async(points)
 
-# Optional ML override/refinement
-if USE_ML:
-    gps_feats = result.get("details", {})
-    _ml_out = _ml_predict_score(MODEL_GPS_PATH, gps_feats)
-    if _ml_out and isinstance(_ml_out.get("score"), (int, float)):
-        # replace primary score with ML score
-        result["gps_score"] = float(_ml_out["score"])
-        result.setdefault("details", {})["ml"] = {
-            "enabled": True,
-            "model_path": MODEL_GPS_PATH,
-            "raw": _ml_out.get("raw", {})
-        }
-    else:
-        result.setdefault("details", {})["ml"] = {"enabled": True, "warning": "model not available; using rules"}
+    # ---- ML Override (preserved) ----
+    if USE_ML:
+        try:
+            gps_feats = result.get("details", {}) or {}
+            _ml_out = _ml_predict_score(MODEL_GPS_PATH, gps_feats)
+            if _ml_out and isinstance(_ml_out.get("score"), (int, float)):
+                result["gps_score"] = float(_ml_out["score"])
+                result.setdefault("details", {})["ml"] = {
+                    "enabled": True,
+                    "model_path": MODEL_GPS_PATH,
+                    "raw": _ml_out.get("raw", {}),
+                }
+            else:
+                result.setdefault("details", {})["ml"] = {"enabled": True, "warning": "model not available; using rules"}
+        except Exception:
+            result.setdefault("details", {})["ml"] = {"enabled": True, "warning": "ml error; using rules"}
 
     # map to ScoreOut
     gps_score = float(result.get("gps_score", 0))
@@ -554,7 +533,7 @@ def _dominant_country(points: List[GPSPointIn]) -> Optional[str]:
     return _mode_or_none([p.country for p in points])
 
 async def compute_gps_score_async(points: List[GPSPointIn]) -> Dict[str, Any]:
-    # manual validation (pydantic v1/v2 safe)
+    # manual validation
     if len(points) > MAX_POINTS:
         raise HTTPException(status_code=413, detail=f"Too many points (>{MAX_POINTS})")
     for p in points:
