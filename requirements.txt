@@ -5,7 +5,7 @@ Pillow
 SQLAlchemy
 psycopg2-binary
 httpx
-python-jose[cryptography]
-passlib[bcrypt]
 python-dotenv
 pydantic<2
+joblib
+scikit-learn
