@@ -66,13 +66,14 @@ class GPSItem(BaseModel):
     flag: Optional[str] = None  # "normal" | "abnormal" | "no_gps"
     city: Optional[str] = None
     country: Optional[str] = None
-
+    
 class GPSIngestResult(BaseModel):
     status: str = "ok"
     user_id: str
+    loan_id: Optional[str] = None
     reference: GPSReference
     items: List[GPSItem]
-
+    
 class ScoreOut(BaseModel):
     loan_id: str
     score: float
@@ -207,6 +208,7 @@ def health() -> Dict[str, str]:
 )
 async def upload_images_for_gps(
     user_id: str,
+    loan_id: str = Form(..., description="Loan/application id"),
     files: List[UploadFile] = File(...),
 ):
     """
@@ -294,7 +296,7 @@ async def upload_images_for_gps(
             )
         )
 
-    return GPSIngestResult(user_id=user_id, reference=reference, items=items)
+    return GPSIngestResult(user_id=user_id, loan_id=loan_id, reference=reference, items=items)
 
 # ---------------- Calllogs CSV scoring ----------------
 @app.post(
