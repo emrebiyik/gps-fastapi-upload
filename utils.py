@@ -10,6 +10,7 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session
 from models import User
 from PIL import Image, ExifTags
+import httpx
 
 # ------------------------- User helper -------------------------
 def get_or_create_user(db: Session, user_id: str) -> User:
