@@ -257,10 +257,6 @@ def score_calllogs_from_csv(file_obj) -> Dict[str, Any]:
         "metrics": m,
     }
 
-# ------------------------- Reverse geocoding (optional) -------------------------
-# Install httpx in requirements.txt to use this.
-import httpx
-
 async def reverse_geocode_city(lat: float, lon: float) -> Tuple[Optional[str], Optional[str]]:
     """
     Reverse geocode (lat, lon) -> (city, country_code_2letters or None).
